@@ -202,6 +202,12 @@ def cmd_doctor(a) -> None:
             line(False, "profile", str(exc)[:160])
             return
 
+    b = gmgn.budget()
+    if b.get("hour") is not None:
+        line(b["ok"], "call budget",
+             f"{b['hour']}/{b['hour_cap']} this hour · {b['day']}/{b['day_cap']} today"
+             + ("" if b["ok"] else "  — SPENT; calls are being refused, not queued"))
+
     try:
         gmgn.call("gas-price", "--chain", a.chain, attempts=1)
         line(True, "api key accepted", "unsigned call succeeded (gas-price)")

@@ -300,6 +300,8 @@ async def api_onboard(request: Request, payload: dict = Body(...)) -> JSONRespon
 
     # Onboarding the same token twice must not stack a second loop or a second wallet scan.
     # The scan is 155 sequential-ish reads; two of them race writes and take twice as long.
+    # An id can be reused after a delete; it must not inherit the dead token's abort.
+    T.clear_abort(d.token_id)
     if _register(_loops, d.token_id, _loop(d.token_id)) is None:
         notes.append("already tracking this token — did not start a second tracker loop")
     if _register(_scans, d.token_id,
@@ -445,8 +447,11 @@ def api_delete_token(request: Request, token_id: int, confirm: str = "") -> JSON
         return JSONResponse(
             {"error": f"confirm did not match — type {t['symbol'] or t['address']!r} exactly"},
             status_code=400)
-    # Cancel first. Deleting the rows out from under a running loop is what produced an
-    # endless `unknown token N` once the loop outlived what it was tracking.
+    # ABORT FIRST, then cancel, then delete. Cancelling an asyncio task does not interrupt the
+    # thread underneath it -- `asyncio.to_thread` runs the scan to completion regardless -- so a
+    # 155-wallet sweep would otherwise keep querying a token that no longer exists. The flag is
+    # what the scan actually checks; the cancel just stops the waiter.
+    T.abort(token_id)
     stopped = _stop_tasks(token_id)
     res = db.delete_token(token_id)
     log.warning("DELETED token %s (%s) — %d rows, %d background task(s) cancelled",

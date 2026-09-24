@@ -14,6 +14,7 @@ measurement that made capture-rate possible, paying for itself twice.
 """
 from __future__ import annotations
 
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -42,6 +43,9 @@ def _ctx(token_id: int) -> tuple[str, str, str]:
 
 # ── pool ──────────────────────────────────────────────────────────────────────
 def track_pool(token_id: int) -> TickResult:
+    if aborted(token_id):
+        return TickResult("pool", False, 0, 0.0,
+                          "skipped — the token was deleted")
     t0 = time.time()
     chain, address, primary = _ctx(token_id)
     try:
@@ -61,6 +65,9 @@ def track_pool(token_id: int) -> TickResult:
 # ── tape ──────────────────────────────────────────────────────────────────────
 def track_tape(token_id: int) -> TickResult:
     """Ingest fills. `is_ours` is decided HERE, once, and never recomputed at display time."""
+    if aborted(token_id):
+        return TickResult("tape", False, 0, 0.0,
+                          "skipped — the token was deleted")
     t0 = time.time()
     chain, address, primary = _ctx(token_id)
     if not primary:
@@ -92,6 +99,35 @@ def track_tape(token_id: int) -> TickResult:
 # 1/MIN_INTERVAL_S calls per second, so raising this trades latency for nothing once the
 # pacer binds -- it is deliberately well under that ceiling.
 BALANCE_WORKERS = 8
+
+# ── stopping work that is already in flight ───────────────────────────────────
+# WHY A FLAG AND NOT A CANCEL. Every long scan runs under `asyncio.to_thread`, and cancelling
+# the awaiting task does NOT interrupt the thread -- it runs to completion regardless. So a
+# 155-wallet sweep for a token that has just been deleted keeps making all 155 calls against a
+# row that no longer exists. Task cancellation cannot reach it; a flag the scan checks between
+# calls can.
+#
+# Checked at every API-call boundary, so an abort costs at most one more call, never a whole
+# sweep.
+_ABORTED: set[int] = set()
+_ABORT_LOCK = threading.Lock()
+
+
+def abort(token_id: int) -> None:
+    """Tell every in-flight scan for this token to stop at its next call boundary."""
+    with _ABORT_LOCK:
+        _ABORTED.add(token_id)
+
+
+def aborted(token_id: int) -> bool:
+    with _ABORT_LOCK:
+        return token_id in _ABORTED
+
+
+def clear_abort(token_id: int) -> None:
+    """Re-onboarding an id that was previously deleted must not inherit its abort."""
+    with _ABORT_LOCK:
+        _ABORTED.discard(token_id)
 
 
 def track_inventory(token_id: int, full: bool = False, window_s: int = 3600,
@@ -130,15 +166,24 @@ def track_inventory(token_id: int, full: bool = False, window_s: int = 3600,
     rows, calls, failed = [], 0, []
 
     def _read(w: str):
+        # Checked per wallet, not per sweep: a delete part-way through stops the rest rather
+        # than paying for every remaining wallet on a token that is gone.
+        if aborted(token_id):
+            return w, None, "aborted"
         try:
-            return w, gmgn.token_balance(chain, w, address), None
+            # `full` is the operator pressing "full pull". That is an explicit request for
+            # current numbers, so it goes past the cache; the background delta sweep does not.
+            return w, gmgn.token_balance(chain, w, address, fresh=full), None
         except gmgn.GmgnError as exc:
             return w, None, exc
 
-    done = 0
+    done, skipped = 0, 0
     with ThreadPoolExecutor(max_workers=min(BALANCE_WORKERS, max(1, len(targets)))) as ex:
         for w, got, exc in ex.map(_read, targets):
             done += 1
+            if exc == "aborted":
+                skipped += 1
+                continue
             if progress:
                 progress(done, len(targets))
             if exc is not None:
@@ -151,6 +196,11 @@ def track_inventory(token_id: int, full: bool = False, window_s: int = 3600,
             else:
                 calls += 1
                 rows.append((w, got[0], got[1]))
+    if skipped:
+        log.info("inventory for token %s aborted — %d wallet(s) never queried", token_id, skipped)
+        return TickResult("inventory", False, calls, time.time() - t0,
+                          f"ABORTED after {calls} of {len(targets)} wallets — {skipped} calls "
+                          f"not made because the token was deleted")
     db.record_balances(token_id, rows)
     ok = not failed
     return TickResult("inventory", ok, calls, time.time() - t0,
@@ -197,6 +247,10 @@ def track_census(token_id: int) -> TickResult:
         return new
 
     for ob in ORDER_BYS:
+        if aborted(token_id):
+            log.info("census for token %s aborted before slice %s", token_id, ob)
+            return TickResult("census", False, calls, time.time() - t0,
+                              f"ABORTED after {calls} slices — the token was deleted")
         try:
             n = absorb(gmgn.traders(chain, address, order_by=ob), None)
             calls += 1
@@ -205,6 +259,11 @@ def track_census(token_id: int) -> TickResult:
         except gmgn.GmgnError as exc:
             log.warning("census slice order-by %s FAILED: %s", ob, exc)
     for tg in TAGS:
+        if aborted(token_id):
+            log.info("census for token %s aborted at tag %s (%d slices done)",
+                     token_id, tg, slices)
+            return TickResult("census", False, calls, time.time() - t0,
+                              f"ABORTED after {calls} calls — the token was deleted")
         for ob in TAG_ORDER_BYS:
             try:
                 absorb(gmgn.traders(chain, address, order_by=ob, tag=tg), tg)

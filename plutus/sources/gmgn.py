@@ -39,6 +39,83 @@ TIMEOUT = 45
 MAX_WAIT_S = 120
 MIN_INTERVAL_S = 0.06          # self-cap well inside the paid bucket
 COMMIT_BUDGET_S = 0.004        # headroom for committing the reservation before firing
+
+# ── total call budget ─────────────────────────────────────────────────────────
+# WHY PACING WAS NOT ENOUGH, AND WHY THIS IS THE PART THAT MATTERS. MIN_INTERVAL_S caps calls
+# per SECOND. It says nothing about calls per hour, and a vendor's abuse detection watches
+# sustained volume, not just instantaneous burst. A thousand calls spread evenly over ninety
+# minutes never trips the pacer once and is exactly the pattern that gets an API key suspended.
+#
+# So there is a hard ceiling, shared across processes in the same database as the pacer. When it
+# is reached, calls do not queue or slow down -- they REFUSE, loudly, naming what to do. A tool
+# that can spend an account's entire quota by being used normally is not finished.
+MAX_CALLS_HOUR = int(os.environ.get("PLUTUS_MAX_CALLS_HOUR") or 900)
+MAX_CALLS_DAY = int(os.environ.get("PLUTUS_MAX_CALLS_DAY") or 6000)
+
+# ── response cache ────────────────────────────────────────────────────────────
+# WHY DELETE + RE-ONBOARD SHOULD BE CHEAP, WITHOUT WEAKENING WHAT DELETE MEANS.
+# Deleting a token removes the token: its rows, its id, its history. Re-adding it is a genuine
+# first-time onboard. None of that requires the tool to FORGET WHAT THE VENDOR SAID SIXTY
+# SECONDS AGO -- that is not the token's data, it is an answer to a question, and asking the
+# same question again that soon gets the same answer at the cost of the account.
+#
+# So the cache is keyed by the CALL, which contains the token address, and lives outside
+# everything token_id-keyed. A delete does not touch it. Re-onboarding inside the TTL rebuilds
+# a fresh token from answers already paid for, and costs nothing.
+#
+# TTLs are per route and short. Anything the operator explicitly asks to refresh passes
+# fresh=True and bypasses the cache entirely -- an explicit pull must never be served a copy.
+CACHE_TTL = {
+    ("token", "info"): 300,
+    ("token", "pool"): 120,
+    ("token", "security"): 900,
+    ("token", "traders"): 180,
+    ("portfolio", "token-balance"): 120,
+    ("portfolio", "info"): 120,
+    ("gas-price",): 60,
+    # ("order", "quote") is deliberately absent: a price is the one thing never served stale.
+}
+CACHE_ON = os.environ.get("PLUTUS_NO_CACHE", "").strip() not in ("1", "true", "yes")
+
+
+def _cache_ttl(args: tuple[str, ...]) -> int:
+    return CACHE_TTL.get(tuple(args[:2]), CACHE_TTL.get(tuple(args[:1]), 0))
+
+
+def _cache_key(args: tuple[str, ...]) -> str:
+    return json.dumps(args, separators=(",", ":"))
+
+
+def _cache_get(args: tuple[str, ...]) -> tuple[bool, Any]:
+    ttl = _cache_ttl(args)
+    if not (CACHE_ON and ttl):
+        return False, None
+    try:
+        row = _pace_db().execute(
+            "SELECT body FROM api_cache WHERE key=? AND ts > ?",
+            (_cache_key(args), time.time() - ttl)).fetchone()
+    except sqlite3.Error:
+        return False, None
+    if row is None:
+        return False, None
+    try:
+        return True, json.loads(row[0])
+    except ValueError:
+        return False, None
+
+
+def _cache_put(args: tuple[str, ...], body: Any) -> None:
+    if not (CACHE_ON and _cache_ttl(args)):
+        return
+    try:
+        c = _pace_db()
+        c.execute("INSERT INTO api_cache (key, ts, body) VALUES (?,?,?) "
+                  "ON CONFLICT(key) DO UPDATE SET ts=excluded.ts, body=excluded.body",
+                  (_cache_key(args), time.time(), json.dumps(body)))
+        c.execute("DELETE FROM api_cache WHERE ts < ?", (time.time() - 3600,))
+    except (sqlite3.Error, TypeError, ValueError):
+        pass                               # a cache that cannot write is still correct
+
 ANALYTICS_HOME = os.environ.get("PLUTUS_GMGN_HOME") or os.path.expanduser("~/.gmgn-analytics")
 
 # Commands that would require a private key. Calling one is a programming error in this layer.
@@ -50,6 +127,10 @@ _rate_lock = threading.Lock()
 
 class GmgnError(RuntimeError):
     pass
+
+
+class BudgetExceeded(GmgnError):
+    """The call budget is spent. Not a failure to retry -- a limit to wait out."""
 
 
 def _env() -> dict[str, str] | None:
@@ -220,6 +301,10 @@ def _pace_db() -> sqlite3.Connection:
             c.execute("PRAGMA busy_timeout=10000")
             c.execute("CREATE TABLE IF NOT EXISTS rate_state ("
                       "k TEXT PRIMARY KEY, next_free REAL NOT NULL)")
+            c.execute("CREATE TABLE IF NOT EXISTS call_log (ts REAL NOT NULL)")
+            c.execute("CREATE TABLE IF NOT EXISTS api_cache ("
+                      "key TEXT PRIMARY KEY, ts REAL NOT NULL, body TEXT NOT NULL)")
+            c.execute("CREATE INDEX IF NOT EXISTS ix_call_log_ts ON call_log(ts)")
             _pace_conn = c
         return _pace_conn
 
@@ -256,6 +341,25 @@ def _reserve_slot() -> float:
         # returning does not overshoot it. Without it the very first call of a process -- the
         # one that finds the clock idle and so waits zero -- fires a few milliseconds after the
         # slot it recorded, and the call after it lands short of a full interval.
+        # Budget check inside the same transaction that reserves the slot: one write lock, and
+        # two processes cannot both be told they have the last call left.
+        c.execute("DELETE FROM call_log WHERE ts < ?", (now - 86400,))
+        hour = c.execute("SELECT COUNT(*) FROM call_log WHERE ts > ?",
+                         (now - 3600,)).fetchone()[0]
+        day = c.execute("SELECT COUNT(*) FROM call_log WHERE ts > ?",
+                        (now - 86400,)).fetchone()[0]
+        if hour >= MAX_CALLS_HOUR or day >= MAX_CALLS_DAY:
+            c.execute("COMMIT")
+            which = "hourly" if hour >= MAX_CALLS_HOUR else "daily"
+            cap = MAX_CALLS_HOUR if which == "hourly" else MAX_CALLS_DAY
+            raise BudgetExceeded(
+                f"{which} API call budget spent: {hour} this hour / {day} today "
+                f"(cap {cap}). Refusing to call rather than risk the key. This usually means "
+                f"something is re-scanning: prefer a full pull over delete+re-onboard, which "
+                f"repeats discovery, calibration and classification for nothing. "
+                f"Raise PLUTUS_MAX_CALLS_{'HOUR' if which == 'hourly' else 'DAY'} if the cap "
+                f"itself is wrong.")
+        c.execute("INSERT INTO call_log (ts) VALUES (?)", (now,))
         start = max(now + COMMIT_BUDGET_S, nxt)
         c.execute("INSERT INTO rate_state (k, next_free) VALUES ('gmgn', ?) "
                   "ON CONFLICT(k) DO UPDATE SET next_free=excluded.next_free",
@@ -290,9 +394,27 @@ def _pace() -> None:
     threads, and keeps them from contending on the database row one at a time.
     """
     with _rate_lock:
-        wait = _reserve_slot()
+        wait = _reserve_slot()            # raises BudgetExceeded rather than spending
     if wait > 0:
         time.sleep(wait)
+
+
+def budget() -> dict:
+    """Where the budget stands. Read-only; safe to call from a page."""
+    now = time.time()
+    try:
+        c = _pace_db()
+        hour = c.execute("SELECT COUNT(*) FROM call_log WHERE ts > ?",
+                         (now - 3600,)).fetchone()[0]
+        day = c.execute("SELECT COUNT(*) FROM call_log WHERE ts > ?",
+                        (now - 86400,)).fetchone()[0]
+    except sqlite3.Error:
+        return {"hour": None, "day": None, "hour_cap": MAX_CALLS_HOUR,
+                "day_cap": MAX_CALLS_DAY, "ok": True}
+    return {"hour": hour, "day": day, "hour_cap": MAX_CALLS_HOUR, "day_cap": MAX_CALLS_DAY,
+            "hour_left": max(0, MAX_CALLS_HOUR - hour),
+            "day_left": max(0, MAX_CALLS_DAY - day),
+            "ok": hour < MAX_CALLS_HOUR and day < MAX_CALLS_DAY}
 
 
 def _cooldown(err: str) -> int | None:
@@ -302,7 +424,7 @@ def _cooldown(err: str) -> int | None:
     return int(m.group(1)) if m else 35
 
 
-def call(*args: str, attempts: int = 3) -> Any:
+def call(*args: str, attempts: int = 3, fresh: bool = False) -> Any:
     """Run one CLI command with --raw and return parsed JSON.
 
     attempts=1 means fail fast: for callers inside a latency-sensitive loop where waiting out a
@@ -314,15 +436,27 @@ def call(*args: str, attempts: int = 3) -> Any:
             raise GmgnError(f"{' '.join(args[:n])!r} requires a private key — "
                             "the analysis layer must never call it")
 
+    # Cache first: a hit costs no call, no budget and no wait.
+    if not fresh:
+        hit, body = _cache_get(args)
+        if hit:
+            log.debug("cache hit: %s", " ".join(args[:3]))
+            return body
+
     if USE_HTTP:
         try:
-            return _http_call(args)
+            got = _http_call(args)
+            _cache_put(args, got)
+            return got
         except _NoRoute:
             pass                                   # no route — fall through to the CLI
+        except BudgetExceeded:
+            raise                          # a spent budget is not something to retry elsewhere
         except GmgnError:
             log.warning("http path failed for %s, falling back to the CLI", " ".join(args[:3]))
 
     cmd = [*CLI, *args, "--raw"]
+
     for attempt in range(1, attempts + 1):
         _pace()
         try:
@@ -333,7 +467,9 @@ def call(*args: str, attempts: int = 3) -> Any:
             continue
         if p.returncode == 0 and p.stdout.strip():
             try:
-                return json.loads(p.stdout)
+                got = json.loads(p.stdout)
+                _cache_put(args, got)
+                return got
             except json.JSONDecodeError as exc:
                 raise GmgnError(f"bad JSON from {' '.join(args[:3])}: {exc}") from None
         err = (p.stderr or p.stdout or "")[:400]
@@ -375,14 +511,15 @@ def traders(chain: str, address: str, order_by: str = "amount_percentage",
     return (d or {}).get("list") or []
 
 
-def token_balance(chain: str, wallet: str, token: str) -> tuple[float, int | None]:
+def token_balance(chain: str, wallet: str, token: str,
+                  fresh: bool = False) -> tuple[float, int | None]:
     """Direct balance for one wallet. Returns (tokens, block_height_of_last_change).
 
     `height` is free provenance the vendor hands us: the block at which this balance last CHANGED.
     Recorded, never discarded.
     """
     d = call("portfolio", "token-balance", "--chain", chain, "--wallet", wallet,
-             "--token", token, attempts=2)
+             "--token", token, attempts=2, fresh=fresh)
     for e in (d or {}).get("balances") or []:
         if (e.get("token_address") or "").lower() == token.lower():
             return float(e.get("balance") or 0), (int(e["height"]) if e.get("height") else None)
