@@ -1,7 +1,7 @@
 """Pool arithmetic: constant product, plus the per-token execution fee that the model alone misses.
 
 WHY THE FEE IS NOT OPTIONAL. On the first token measured, the pool's own `fee` field read 0 and
-pure `x*y=k` said a $100 buy should cost 0.67%. It actually cost 5.57%. The gap is a constant
+pure `x*y=k` said a small buy should cost a fraction of a percent. It actually cost several times that. The gap is a constant
 MULTIPLICATIVE fee (a v4 hook, most likely the launchpad's), and decomposing
 
     total_cost = 1 - (1 - fee)(1 - curve_impact)
@@ -132,8 +132,8 @@ class Calibration:
 
         THE MODEL DOES NOT PROMISE UNIFORM ACCURACY, and pretending otherwise is how a ladder
         gets sized on a number that was never that good. On the first token calibrated the
-        implied fee drifts DOWN as size grows , most plausibly
-        because the router begins splitting across the eleven dust venues once an order is large
+        implied fee drifts DOWN as size grows, most plausibly
+        because the router begins splitting across the smaller venues once an order is large
         enough to be worth it. A single constant therefore fits small fills well and large ones
         loosely: error grew from a rounding error at small size to a couple of percent at the top.
 

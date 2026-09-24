@@ -12,3 +12,6 @@ tokens/*.toml
 !tokens/example.toml
 wallets/*.txt
 !wallets/example.txt
+
+# pipeline state and planning — private, backed up in the moradin repo
+.forge/

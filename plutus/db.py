@@ -75,7 +75,7 @@ CREATE TABLE IF NOT EXISTS pool_obs (
 ) WITHOUT ROWID;
 
 -- is_ours is decided ON INGEST, never at display time. Any flow number computed on unsplit
--- tape is a bug: on the first token measured, about a fifth of volume of volume was the operator's own wallets
+-- tape is a bug: on the first token measured, about a fifth of volume was the operator's own wallets
 -- and the raw chart read almost twice the real organic demand.
 CREATE TABLE IF NOT EXISTS trades (
   token_id INTEGER NOT NULL, tx_hash TEXT NOT NULL, log_idx INTEGER DEFAULT 0,
