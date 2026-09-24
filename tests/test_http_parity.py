@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import os
 import pathlib
+import subprocess
 import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
@@ -54,7 +55,10 @@ def _pick_token() -> str:
     """A live token on this chain, found without hardcoding one that may be gone."""
     import json
     import subprocess
-    p = subprocess.run(["cmd.exe", "/c", "gmgn-cli", "market", "trending", "--chain", CHAIN,
+    # gmgn.CLI, not a literal: it is ["cmd.exe", "/c", "gmgn-cli"] on Windows and ["gmgn-cli"]
+    # everywhere else. Hardcoding the Windows form made this the only test that could not run
+    # on the machine the service actually deploys to.
+    p = subprocess.run([*gmgn.CLI, "market", "trending", "--chain", CHAIN,
                         "--interval", "24h", "--limit", "3", "--raw"],
                        capture_output=True, text=True, timeout=60, env=gmgn._env(),
                        encoding="utf-8", errors="replace")
@@ -72,9 +76,19 @@ def _check(name, args):
     return http
 
 
+def _cli_available() -> bool:
+    try:
+        r = subprocess.run([*gmgn.CLI, "--version"], capture_output=True, timeout=30)
+        return r.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
 def test_parity_across_every_route():
     if not gmgn._api_key():
         print("  no API key — skipping"); return
+    if not _cli_available():
+        print("  gmgn-cli not runnable here — skipping the CLI side of parity"); return
     tok = _pick_token()
     wallet = (gmgn.traders(CHAIN, tok, limit=3) or [{}])[0].get("address")
     assert wallet, "could not find a live wallet to test with"
@@ -94,8 +108,8 @@ def test_parity_across_every_route():
 
 def test_balance_values_agree_not_just_shapes():
     """Shape parity is not enough — the number itself has to match."""
-    if not gmgn._api_key():
-        print("  no API key — skipping"); return
+    if not gmgn._api_key() or not _cli_available():
+        print("  no API key or no gmgn-cli — skipping"); return
     tok = _pick_token()
     wallet = (gmgn.traders(CHAIN, tok, limit=3) or [{}])[0].get("address")
 

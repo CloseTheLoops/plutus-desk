@@ -162,6 +162,29 @@ addresses an attacker claims.
 If you run uvicorn directly rather than through `plutus.cli serve`, set `PLUTUS_BIND_HOST`
 yourself so the app knows what it bound to, and pass `--proxy-headers`.
 
+### If your proxy already authenticates
+
+Some deployments sit behind a gate that authenticates every request before it arrives — an SSO
+proxy, a password gate, a private network. A second password there is redundant. Say so
+explicitly:
+
+```bash
+PLUTUS_TRUST_PROXY_AUTH=1
+```
+
+Every request arriving from loopback is then treated as the operator. It is honoured only when
+the *peer* is loopback, so it cannot be switched on by a header from outside, and the server logs
+a warning at startup naming the assumption.
+
+Use this **instead of** relying on the no-password bootstrap. Bootstrap is a first-run
+convenience, not a security model: it is refused for proxied requests precisely so that an
+unconfigured server cannot be claimed by a passer-by. Depending on it for a live deployment means
+depending on behaviour that is meant to stop working.
+
+The assumption it encodes is real: if that gate is ever removed, misconfigured, or bypassed by a
+route that skips it, every write here is open. Setting an admin password as well costs one extra
+login and removes that single point of failure.
+
 **Rate limits are shared per API key, not per process.** The pacer's clock lives in the database,
 so the service and any CLI command coordinate automatically — but only if they use the same
 `data/` directory. Two checkouts with separate databases are two independent budgets.

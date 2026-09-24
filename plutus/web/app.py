@@ -688,6 +688,18 @@ BIND_HOST = os.environ.get("PLUTUS_BIND_HOST", "127.0.0.1").strip()
 TRUST_LOOPBACK = BIND_HOST in _LOOPBACK
 COOKIE = "plutus_session"
 
+# AN AUTHENTICATED GATE IN FRONT. Some deployments already sit behind a proxy that authenticates
+# every request before it reaches here -- an SSO proxy, a password gate, a private network. For
+# those, a second password is redundant and annoying, and the honest arrangement is to say so
+# explicitly rather than to lean on the no-password bootstrap, which is a first-run convenience
+# and not a security model.
+#
+# Setting this means: "everything that reaches this port has already been authenticated by
+# something I control." If that gate is ever removed, misconfigured, or bypassed by a route that
+# skips it, every write here is open. It is honoured only for requests whose PEER is loopback,
+# so it cannot be turned on by a header from outside.
+TRUST_PROXY_AUTH = os.environ.get("PLUTUS_TRUST_PROXY_AUTH", "").strip() in ("1", "true", "yes")
+
 # Guessing costs time. scrypt already makes each attempt expensive; this stops a script from
 # running thousands of them in parallel and keeps the log readable.
 _LOGIN_FAILS: dict[str, list[float]] = {}
@@ -727,6 +739,10 @@ def _client(request: Request) -> str:
 
 def _is_operator(request: Request) -> bool:
     if auth.verify_session(request.cookies.get(COOKIE)):
+        return True
+    # An operator-declared gate in front. Peer must still be loopback: the flag says the proxy
+    # authenticates, and the proxy is what connects.
+    if TRUST_PROXY_AUTH and _peer(request) in _LOOPBACK:
         return True
     # Nobody has set a password yet: let the machine running the server get started. Never
     # through a proxy -- there, loopback is the proxy, not the operator, and this would hand
@@ -871,7 +887,11 @@ async def _loop(token_id: int) -> None:
 
 @app.on_event("startup")
 async def _startup() -> None:
-    if not auth.is_configured():
+    if TRUST_PROXY_AUTH:
+        log.warning("PLUTUS_TRUST_PROXY_AUTH is on: every request arriving from loopback is "
+                    "treated as the operator. This is correct ONLY if an authenticated gate "
+                    "sits in front of this port and nothing can reach it directly.")
+    elif not auth.is_configured():
         log.warning("no admin password set — anyone who can reach this port can change things. "
                     "Set one with: python -m plutus.cli setpassword")
     for t in db.all_tokens():

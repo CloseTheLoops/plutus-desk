@@ -200,6 +200,32 @@ def test_session_cookie_is_secure_behind_tls():
     assert "secure=" in src and "x-forwarded-proto" in src,         "the session cookie is not marked secure when TLS terminated at a proxy"
     assert "httponly=True" in src, "the session cookie must not be readable from JavaScript"
 
+
+def test_an_explicit_gate_flag_restores_write_access_behind_a_proxy():
+    """For deployments whose proxy already authenticates. Opt-in, never inferred."""
+    prev_flag, prev_path = app.TRUST_PROXY_AUTH, auth.PATH
+    auth.PATH = ROOT / "data" / "admin_absent.json"
+    app.TRUST_PROXY_AUTH = True
+    try:
+        r = _Req("127.0.0.1", headers={"x-forwarded-for": "203.0.113.9"})
+        assert app._is_operator(r),             "the explicit gate flag did not restore write access for proxied traffic"
+    finally:
+        app.TRUST_PROXY_AUTH, auth.PATH = prev_flag, prev_path
+
+
+def test_the_gate_flag_cannot_be_turned_on_from_outside():
+    """It trusts the PEER, so a direct connection from elsewhere gains nothing."""
+    prev_flag, prev_path = app.TRUST_PROXY_AUTH, auth.PATH
+    auth.PATH = ROOT / "data" / "admin_absent.json"
+    app.TRUST_PROXY_AUTH = True
+    try:
+        for host in ("203.0.113.9", "10.0.0.5", ""):
+            assert not app._is_operator(_Req(host)), (
+                f"{host} connected directly and was trusted — the flag must only cover traffic "
+                f"arriving through the local gate")
+    finally:
+        app.TRUST_PROXY_AUTH, auth.PATH = prev_flag, prev_path
+
 if __name__ == "__main__":
     fails = 0
     for name, fn in sorted(globals().items()):
