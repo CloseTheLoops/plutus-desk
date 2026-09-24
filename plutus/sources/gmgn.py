@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import sqlite3
 import subprocess
 import threading
 import time
@@ -37,6 +38,7 @@ _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 
 TIMEOUT = 45
 MAX_WAIT_S = 120
 MIN_INTERVAL_S = 0.06          # self-cap well inside the paid bucket
+COMMIT_BUDGET_S = 0.004        # headroom for committing the reservation before firing
 ANALYTICS_HOME = os.environ.get("PLUTUS_GMGN_HOME") or os.path.expanduser("~/.gmgn-analytics")
 
 # Commands that would require a private key. Calling one is a programming error in this layer.
@@ -198,20 +200,99 @@ class _NoRoute(Exception):
     """This call has no HTTP route; use the CLI."""
 
 
-def _pace() -> None:
-    """Hold the global minimum interval between calls, across threads.
+_pace_conn: sqlite3.Connection | None = None
+_pace_conn_lock = threading.Lock()
 
-    This has to be a real lock now that the balance sweep calls concurrently. Without it every
-    worker reads the same `_last_call`, computes the same gap, sleeps it, and fires together --
-    which is precisely the burst the interval exists to prevent. The lock makes the interval a
-    property of the process rather than of each thread.
+
+def _pace_db() -> sqlite3.Connection:
+    """A connection used ONLY by the pacer.
+
+    Separate from db.connect() on purpose: that connection is often mid-transaction writing
+    balances or trades, and issuing BEGIN IMMEDIATE on a connection already in a transaction is
+    an error. The pacer must never be able to disturb, or be disturbed by, real work.
+    """
+    global _pace_conn
+    with _pace_conn_lock:
+        if _pace_conn is None:
+            c = sqlite3.connect(str(config.DB_PATH), timeout=10, check_same_thread=False,
+                                isolation_level=None)
+            c.execute("PRAGMA journal_mode=WAL")
+            c.execute("PRAGMA busy_timeout=10000")
+            c.execute("CREATE TABLE IF NOT EXISTS rate_state ("
+                      "k TEXT PRIMARY KEY, next_free REAL NOT NULL)")
+            _pace_conn = c
+        return _pace_conn
+
+
+def _reserve_slot() -> float:
+    """Claim the next free moment to call, and return how long to wait for it.
+
+    RESERVATION, NOT A HELD LOCK. The obvious implementation -- open a write transaction, read
+    the clock, sleep, write it back, commit -- holds SQLite's single writer lock for the whole
+    sleep, so every unrelated write (balances, trades, pool observations) queues behind the rate
+    limiter. Instead this moves `next_free` forward by one interval and commits in microseconds;
+    the caller then sleeps outside the transaction until the slot it was given. Concurrent
+    callers get distinct, consecutive slots, which is exactly the intended behaviour.
+
+    The row is keyed by nothing token-specific, because the limit belongs to the API KEY.
     """
     global _last_call
+    now = time.time()
+    try:
+        c = _pace_db()
+        c.execute("BEGIN IMMEDIATE")
+        # Read the clock AFTER the write lock is held, not before. Waiting for the lock can
+        # take several milliseconds, and anchoring the reservation to a pre-lock timestamp
+        # hands out a slot that is already in the past -- so the call fires late while the NEXT
+        # slot was recorded from the stale reading, leaving the two closer than the interval.
+        now = time.time()
+        row = c.execute("SELECT next_free FROM rate_state WHERE k='gmgn'").fetchone()
+        nxt = float(row[0]) if row else 0.0
+        # A value far in the future means a clock change or a crashed reservation, not a real
+        # queue. Waiting it out would stall every caller for as long as the skew.
+        if nxt > now + 5.0:
+            nxt = now
+        # COMMIT_BUDGET keeps the slot marginally in the future so that committing and
+        # returning does not overshoot it. Without it the very first call of a process -- the
+        # one that finds the clock idle and so waits zero -- fires a few milliseconds after the
+        # slot it recorded, and the call after it lands short of a full interval.
+        start = max(now + COMMIT_BUDGET_S, nxt)
+        c.execute("INSERT INTO rate_state (k, next_free) VALUES ('gmgn', ?) "
+                  "ON CONFLICT(k) DO UPDATE SET next_free=excluded.next_free",
+                  (start + MIN_INTERVAL_S,))
+        c.execute("COMMIT")
+        _last_call = start           # keep the fallback clock usable if the db later fails
+        # Measure the wait against the time it is NOW, not the `now` read before the
+        # transaction. Acquiring the write lock takes a variable few milliseconds, and sleeping
+        # a delta computed before it means firing that much LATE. A call that fires late
+        # followed by one that fires on time leaves a gap shorter than the interval -- which is
+        # precisely the violation this whole mechanism exists to prevent. Sleeping to the
+        # absolute slot instead absorbs the overhead.
+        return max(0.0, start - time.time())
+    except sqlite3.Error as exc:
+        log.debug("pacer fell back to the in-process clock: %s", exc)
+        start = max(now, _last_call + MIN_INTERVAL_S)
+        _last_call = start
+        return max(0.0, start - now)
+
+
+def _pace() -> None:
+    """Hold the global minimum interval between calls -- across threads AND processes.
+
+    WHY THIS IS NOT JUST A LOCK. A threading.Lock serialises the calls inside one interpreter and
+    knows nothing about any other process using the same API key. The service tracks tokens
+    continuously while an operator can run `plutus.cli tick` beside it; each kept its own private
+    clock, so the key saw two independent streams and twice the intended rate. The interval
+    belongs to the key, so its state has to live somewhere both processes can see -- and the
+    project already has exactly one such place.
+
+    The in-process lock is kept in front of it: it costs nothing, orders this process's own
+    threads, and keeps them from contending on the database row one at a time.
+    """
     with _rate_lock:
-        gap = MIN_INTERVAL_S - (time.time() - _last_call)
-        if gap > 0:
-            time.sleep(gap)
-        _last_call = time.time()
+        wait = _reserve_slot()
+    if wait > 0:
+        time.sleep(wait)
 
 
 def _cooldown(err: str) -> int | None:
