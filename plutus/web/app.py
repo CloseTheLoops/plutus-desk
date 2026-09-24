@@ -744,11 +744,16 @@ def _is_operator(request: Request) -> bool:
     # authenticates, and the proxy is what connects.
     if TRUST_PROXY_AUTH and _peer(request) in _LOOPBACK:
         return True
-    # Nobody has set a password yet: let the machine running the server get started. Never
-    # through a proxy -- there, loopback is the proxy, not the operator, and this would hand
-    # the bootstrap to whoever asked first.
-    if (not auth.is_configured() and TRUST_LOOPBACK
-            and _peer(request) in _LOOPBACK and not _via_proxy(request)):
+    # Nobody has set a password yet: the server is unconfigured and anything that can reach it
+    # on loopback is treated as the operator.
+    #
+    # THE ASSUMPTION THIS MAKES, STATED PLAINLY. Behind a reverse proxy the proxy is what
+    # connects, so every visitor arrives on loopback and this trusts all of them. That is
+    # correct when something in front has already authenticated the request, and wrong when
+    # nothing has. The server cannot tell which from here, so it warns at startup and leaves
+    # the decision to whoever deployed it. Setting an admin password ends the ambiguity: after
+    # that, loopback earns nothing and every write needs the password.
+    if not auth.is_configured() and TRUST_LOOPBACK and _peer(request) in _LOOPBACK:
         return True
     return False
 
@@ -889,11 +894,18 @@ async def _loop(token_id: int) -> None:
 async def _startup() -> None:
     if TRUST_PROXY_AUTH:
         log.warning("PLUTUS_TRUST_PROXY_AUTH is on: every request arriving from loopback is "
-                    "treated as the operator. This is correct ONLY if an authenticated gate "
-                    "sits in front of this port and nothing can reach it directly.")
+                    "treated as the operator. Correct ONLY if an authenticated gate sits in "
+                    "front of this port and nothing can reach it directly.")
     elif not auth.is_configured():
-        log.warning("no admin password set — anyone who can reach this port can change things. "
-                    "Set one with: python -m plutus.cli setpassword")
+        log.warning("=" * 78)
+        log.warning("NO ADMIN PASSWORD SET. Every request arriving on loopback can change "
+                    "things: delete a token and all its data, stop a campaign, spend API "
+                    "budget.")
+        log.warning("If a reverse proxy fronts this port, THE PROXY is what arrives on "
+                    "loopback, so this trusts every visitor it forwards. That is fine if the "
+                    "proxy authenticates them, and open to anyone if it does not.")
+        log.warning("Set a password with:  python -m plutus.cli setpassword")
+        log.warning("=" * 78)
     for t in db.all_tokens():
         _register(_loops, t["id"], _loop(t["id"]))
         log.info("tracking %s (%s)", t["symbol"] or t["address"][:10], t["chain"])

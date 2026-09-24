@@ -162,23 +162,32 @@ def test_no_password_is_committed_anywhere_in_the_repo():
 
 
 
-def test_bootstrap_is_refused_through_a_reverse_proxy():
-    """THE deployment trap. A proxied app binds to 127.0.0.1 so only the proxy can reach it --
-    which is also exactly what makes every visitor look like they are on loopback. With no
-    password set, the first stranger to load the page would otherwise be handed the desk."""
+def test_bootstrap_trusts_proxied_loopback_by_design():
+    """DELIBERATE, and the operator's decision rather than the code's.
+
+    An unconfigured server treats anything arriving on loopback as the operator, including a
+    reverse proxy forwarding a stranger. That is correct when the proxy authenticates and wrong
+    when it does not, and the server cannot tell which from here -- so it warns loudly at
+    startup instead of guessing. Setting an admin password ends the ambiguity, which is what
+    test_once_a_password_exists_loopback_earns_nothing pins down.
+    """
     prev, prev_trust = auth.PATH, app.TRUST_LOOPBACK
     auth.PATH = ROOT / "data" / "admin_absent.json"
-    app.TRUST_LOOPBACK = True                      # bound to 127.0.0.1, as a proxied app is
+    app.TRUST_LOOPBACK = True
     try:
         assert not auth.is_configured()
-        assert app._is_operator(_Req("127.0.0.1")), "direct local bootstrap should still work"
-        for hdr in ("x-forwarded-for", "x-real-ip", "forwarded", "x-forwarded-host"):
-            r = _Req("127.0.0.1", headers={hdr: "203.0.113.9"})
-            assert not app._is_operator(r), (
-                f"a request carrying {hdr} was bootstrap-trusted — behind a proxy that hands "
-                f"the unconfigured desk to whoever loads it first")
+        proxied = _Req("127.0.0.1", headers={"x-forwarded-for": "203.0.113.9"})
+        assert app._is_operator(proxied),             "proxied loopback lost write access on an unconfigured server — this is the "             "behaviour a gated deployment depends on"
+        assert not app._is_operator(_Req("203.0.113.9")),             "a direct connection from off-box must never be trusted"
     finally:
         auth.PATH, app.TRUST_LOOPBACK = prev, prev_trust
+
+
+def test_the_startup_warning_names_the_proxy_case():
+    """The safety here is an informed operator, so the warning has to actually say it."""
+    import inspect
+    src = inspect.getsource(app._startup)
+    assert "reverse proxy" in src.lower() and "setpassword" in src,         "the unconfigured-server warning does not explain the proxy case or how to fix it"
 
 
 def test_rate_limit_cannot_be_evaded_by_rotating_the_forwarded_header():

@@ -134,11 +134,17 @@ reachable:
 python -m plutus.cli setpassword          # prompts, or reads PLUTUS_ADMIN_PASSWORD
 ```
 
-Until a password is set, the server lets a caller **on the machine itself** through so a fresh
-install is usable. That bootstrap is refused for any request carrying a forwarding header
-(`X-Forwarded-For`, `X-Real-IP`, `Forwarded`, `X-Forwarded-Host`), because a proxied app is
-normally bound to `127.0.0.1` — which is also exactly what makes every visitor look local. Set
-the password first and the question never arises: once one exists, loopback earns nothing.
+Until a password is set, the server treats anything arriving on **loopback** as the operator, so
+a fresh install is usable immediately.
+
+Know what that means behind a proxy: the proxy is what connects, so every visitor it forwards
+arrives on loopback and is trusted. That is correct when the proxy authenticates them — an SSO
+proxy, a password gate, a private network — and open to anyone when it does not. The server
+cannot tell which from the inside, so it prints a loud warning at startup and leaves the call to
+you.
+
+Setting a password ends the ambiguity. After that, loopback earns nothing and every write needs
+the password, whatever is in front.
 
 Run the app on loopback and let the proxy reach it:
 
@@ -176,14 +182,13 @@ Every request arriving from loopback is then treated as the operator. It is hono
 the *peer* is loopback, so it cannot be switched on by a header from outside, and the server logs
 a warning at startup naming the assumption.
 
-Use this **instead of** relying on the no-password bootstrap. Bootstrap is a first-run
-convenience, not a security model: it is refused for proxied requests precisely so that an
-unconfigured server cannot be claimed by a passer-by. Depending on it for a live deployment means
-depending on behaviour that is meant to stop working.
+An unconfigured server behaves the same way, so this flag changes nothing on its own. It is
+worth setting anyway: it records the assumption in the unit file where the next person to read it
+will see it, and it keeps working if a password is ever added for other reasons.
 
-The assumption it encodes is real: if that gate is ever removed, misconfigured, or bypassed by a
-route that skips it, every write here is open. Setting an admin password as well costs one extra
-login and removes that single point of failure.
+The assumption is real either way: if that gate is removed, misconfigured, or bypassed by a route
+that skips it, every write here is open. An admin password costs one extra login and removes that
+single point of failure.
 
 **Rate limits are shared per API key, not per process.** The pacer's clock lives in the database,
 so the service and any CLI command coordinate automatically — but only if they use the same
