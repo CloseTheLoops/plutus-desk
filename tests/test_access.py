@@ -124,24 +124,41 @@ def test_password_is_hashed_not_stored():
 
 
 def test_no_password_is_committed_anywhere_in_the_repo():
-    """A password in a public repository is public permanently; rotating does not un-publish."""
+    """A password in a public repository is public permanently; rotating does not un-publish it.
+
+    NOTE ON THIS TEST'S OWN HISTORY. The first version listed the real password as a search
+    needle -- so the test asserting that passwords are not committed committed the password.
+    A check for a known secret is itself a disclosure of that secret. It has to match the SHAPE
+    of a hardcoded credential and never a value.
+    """
+    import re
     import subprocess
+
     tracked = subprocess.run(["git", "ls-files"], cwd=ROOT, capture_output=True,
                              text=True).stdout.split()
     assert "data/admin.json" not in tracked, "the admin hash file is tracked by git"
+
+    patterns = [
+        re.compile(r"""set_password\(\s*['"][^'"]{4,}['"]"""),
+        re.compile(r"""PLUTUS_ADMIN_PASSWORD\s*=\s*['"][^'"]{4,}['"]"""),
+        re.compile(r"""(?i)\b(admin_?password|passwd)\s*=\s*['"][^'"]{6,}['"]"""),
+    ]
+    allow = {"tests/test_access.py"}          # this file names the shapes in order to find them
     bad = []
     for rel in tracked:
+        if rel in allow:
+            continue
         f = ROOT / rel
-        if not f.is_file() or f.suffix in (".png", ".ico", ".jpg"):
+        if not f.is_file() or f.suffix in (".png", ".ico", ".jpg", ".db"):
             continue
         try:
             body = f.read_text(encoding="utf-8", errors="ignore")
         except OSError:
             continue
-        for needle in ("Faith123", "PLUTUS_ADMIN_PASSWORD="):
-            if needle in body and "getpass" not in body and "environ.get" not in body:
-                bad.append(f"{rel}: {needle}")
-    assert not bad, f"a literal password appears in tracked files: {bad}"
+        for rx in patterns:
+            for m in rx.finditer(body):
+                bad.append(f"{rel}:{body[:m.start()].count(chr(10)) + 1}")
+    assert not bad, f"a hardcoded credential appears in tracked files: {sorted(set(bad))}"
 
 
 if __name__ == "__main__":
