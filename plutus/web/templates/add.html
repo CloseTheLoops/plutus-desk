@@ -217,12 +217,55 @@ $('go').onclick=async()=>{
       visibly move the ledger.</div>`
       :'<div class="note good">✓ nothing looks like a misfiled contract</div>'}
     <div style="margin-top:12px">
-      <button id="save">Save classifications &amp; open analysis</button>
+      <button id="save" disabled>Save classifications &amp; open analysis</button>
       <button class="sec" onclick="location.href='/?token_id=${r.token_id}'">Skip — open analysis</button>
     </div>
-    <div class="note">Trackers have already started for this token. The first full inventory and
-    holder census take about two minutes.</div>
+    <div class="note" id="scanNote"><span class="spin"></span> scanning wallets — the worksheet
+    below is incomplete until this finishes, so saving is held until then.</div>
   </div>`;
+
+  // ── wait for the scan before offering to save ───────────────────────────────
+  // The worksheet is built from the balance sweep and census, which /api/onboard starts in the
+  // BACKGROUND. Rendering it immediately meant the operator was offered "0 addresses above
+  // 0.2%" and a live Save button over data that had not arrived -- and saving then posts an
+  // empty change-list, silently skipping the review step. Anything the census would have
+  // flagged is never seen, because the page has already moved on.
+  //
+  // Gated on the scan actually finishing, never on a timer: real scans have run from ~10s to
+  // over two minutes depending on wallet count and API conditions.
+  (async function awaitScan(){
+    const note=$('scanNote'), btn=$('save'), t0=Date.now();
+    for(;;){
+      let j=null;
+      try{ j=await (await fetch('/api/refresh_status?token_id='+r.token_id)).json(); }
+      catch(e){ /* transient — keep waiting */ }
+      const s=j&&j.scan, secs=Math.round((Date.now()-t0)/1000);
+      if(s&&s.running){
+        const prog=(s.of? ` <b>${s.done}/${s.of}</b> wallets` : '');
+        note.innerHTML=`<span class="spin"></span> scanning wallets${prog} · ${secs}s elapsed`
+          + ' — saving is held until this finishes, so the review step is not skipped.';
+      }else if(s&&!s.running){
+        // Re-fetch the worksheet: the one on screen was built before the sweep landed.
+        try{
+          const w=await (await fetch('/api/worksheet?token_id='+r.token_id)).json();
+          if(Array.isArray(w)&&w.length!==ws.length){
+            note.innerHTML=`<span class="good">✓ scan complete in ${secs}s</span> — the`
+              + ` worksheet now has <b>${w.length}</b> addresses; reloading it.`;
+            r.worksheet=w; setTimeout(()=>render(r),900); return;
+          }
+        }catch(e){ /* fall through and just unlock */ }
+        note.innerHTML=`<span class="good">✓ scan complete in ${secs}s</span>`
+          + (s.ok===false? ` <span class="warn">— ${s.detail||'it did not finish cleanly'}</span>`:'');
+        btn.disabled=false; return;
+      }else if(secs>10){
+        // No scan was registered for this token (already onboarded, or it finished before the
+        // first poll). Nothing to wait for.
+        note.textContent='no background scan is running for this token.';
+        btn.disabled=false; return;
+      }
+      await new Promise(z=>setTimeout(z,1500));
+    }
+  })();
 
   $('save').onclick=async()=>{
     const changes=[...document.querySelectorAll('.rc')].map(s=>({address:s.dataset.a,cls:s.value}));

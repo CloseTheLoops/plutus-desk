@@ -302,10 +302,10 @@ async def api_onboard(request: Request, payload: dict = Body(...)) -> JSONRespon
     # The scan is 155 sequential-ish reads; two of them race writes and take twice as long.
     # An id can be reused after a delete; it must not inherit the dead token's abort.
     T.clear_abort(d.token_id)
+    _scan_state.pop(d.token_id, None)
     if _register(_loops, d.token_id, _loop(d.token_id)) is None:
         notes.append("already tracking this token — did not start a second tracker loop")
-    if _register(_scans, d.token_id,
-                 asyncio.to_thread(T.track_inventory, d.token_id, True)) is None:
+    if _register(_scans, d.token_id, _onboard_scan(d.token_id)) is None:
         notes.append("a full wallet scan for this token is already running — not starting "
                      "another; watch the pull status for its progress")
 
@@ -453,6 +453,7 @@ def api_delete_token(request: Request, token_id: int, confirm: str = "") -> JSON
     # what the scan actually checks; the cancel just stops the waiter.
     T.abort(token_id)
     stopped = _stop_tasks(token_id)
+    _scan_state.pop(token_id, None)
     res = db.delete_token(token_id)
     log.warning("DELETED token %s (%s) — %d rows, %d background task(s) cancelled",
                 token_id, t["symbol"], res["rows"], stopped)
@@ -579,7 +580,19 @@ async def api_refresh(request: Request, token_id: int = 1, full: bool = False) -
 
 @app.get("/api/refresh")
 def api_refresh_status(token_id: int = 1) -> JSONResponse:
-    return JSONResponse(_jobs.get(token_id, {"running": False, "stage": None}))
+    """One status source for both kinds of background work.
+
+    A full pull registers in _jobs; the onboarding scan registers in _scans. The page should not
+    have to know which started its work, so both are reported here.
+    """
+    j = dict(_jobs.get(token_id, {"running": False, "stage": None}))
+    s = _scan_state.get(token_id)
+    if s is not None:
+        j["scan"] = dict(s)
+        if s.get("running"):
+            j["running"] = True
+            j["stage"] = j.get("stage") or "inventory"
+    return JSONResponse(j)
 
 
 @app.post("/api/campaign")
@@ -840,6 +853,35 @@ def api_logout() -> JSONResponse:
 _onboarding: set[tuple[str, str]] = set()
 _loops: dict[int, asyncio.Task] = {}
 _scans: dict[int, asyncio.Task] = {}
+
+# Observable state for the onboarding scan. The task object alone cannot answer "how far along",
+# and /api/refresh_status only ever saw _jobs -- which /api/refresh?full=true populates and
+# onboarding does not. So the worksheet had nothing real to wait for and offered its Save button
+# over data that had not arrived.
+_scan_state: dict[int, dict] = {}
+
+
+async def _onboard_scan(token_id: int) -> None:
+    """The first full inventory, with its progress visible to the page."""
+    st = {"running": True, "started": db.now(), "done": 0, "of": None,
+          "ok": None, "detail": ""}
+    _scan_state[token_id] = st
+
+    def progress(done: int, of: int) -> None:
+        st["done"], st["of"] = done, of
+
+    try:
+        r = await asyncio.to_thread(T.track_inventory, token_id, True, 3600, progress)
+        st.update(ok=r.ok, detail=r.detail)
+    except asyncio.CancelledError:
+        st.update(ok=False, detail="cancelled — the token was deleted")
+        raise
+    except Exception as exc:                  # noqa: BLE001 — a failed scan must still finish
+        log.exception("onboarding scan failed for token %s", token_id)
+        st.update(ok=False, detail=str(exc)[:200])
+    finally:
+        st["running"] = False
+        st["finished"] = db.now()
 
 
 def _register(reg: dict, token_id: int, coro) -> asyncio.Task | None:

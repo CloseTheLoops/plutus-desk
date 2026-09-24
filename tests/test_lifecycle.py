@@ -21,6 +21,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 from plutus import config  # noqa: E402
 
+ROOT = pathlib.Path(__file__).resolve().parent.parent
 _DB = pathlib.Path(tempfile.gettempdir()) / "plutus_test_lifecycle.db"
 
 
@@ -138,6 +139,76 @@ def test_onboard_refuses_a_concurrent_discovery():
     assert "status_code=409" in src, "a duplicate onboard should be refused, not queued"
     assert "finally:" in src, "the in-flight marker must be cleared even when discovery raises"
 
+
+
+def test_the_onboarding_scan_is_visible_to_the_status_endpoint():
+    """The worksheet had nothing real to wait for.
+
+    /api/onboard starts its sweep in _scans; /api/refresh_status only ever read _jobs, which
+    only /api/refresh?full=true populates. So the page could not tell whether the data behind
+    its worksheet had arrived, and offered a Save button over an empty one.
+    """
+    import inspect
+    from plutus.web import app
+    src = inspect.getsource(app.api_refresh_status)
+    assert "_scan_state" in src,         "refresh_status still reports only _jobs, so the onboarding scan is invisible to the UI"
+
+
+def test_scan_state_tracks_a_run_from_start_to_finish():
+    db = _fresh_db()
+    from plutus.web import app
+    from plutus.track import trackers as T
+
+    tid = db.upsert_token("robinhood", "0x" + "a" * 40, symbol="T")
+    seen = {}
+
+    def fake(token_id, full=False, window_s=3600, progress=None):
+        seen["running_during"] = app._scan_state[token_id]["running"]
+        if progress:
+            progress(7, 9)
+        return T.TickResult("inventory", True, 9, 0.1, "done")
+
+    real, T.track_inventory = T.track_inventory, fake
+    try:
+        asyncio.run(app._onboard_scan(tid))
+    finally:
+        T.track_inventory = real
+
+    st = app._scan_state[tid]
+    assert seen.get("running_during") is True, "state was not marked running during the scan"
+    assert st["running"] is False, "state was left running after the scan finished"
+    assert (st["done"], st["of"]) == (7, 9), f"progress was not recorded: {st}"
+    assert st["ok"] is True and "finished" in st
+
+
+def test_a_failing_scan_still_marks_itself_finished():
+    """A scan that raises must not leave the page waiting forever on a button that never unlocks."""
+    db = _fresh_db()
+    from plutus.web import app
+    from plutus.track import trackers as T
+
+    tid = db.upsert_token("robinhood", "0x" + "b" * 40, symbol="T2")
+
+    def boom(*a, **k):
+        raise RuntimeError("vendor said no")
+
+    real, T.track_inventory = T.track_inventory, boom
+    try:
+        asyncio.run(app._onboard_scan(tid))
+    finally:
+        T.track_inventory = real
+
+    st = app._scan_state[tid]
+    assert st["running"] is False, "a failed scan left the UI waiting on a running flag"
+    assert st["ok"] is False and "vendor said no" in st["detail"]
+
+
+def test_the_save_button_starts_disabled_and_waits_on_the_scan():
+    tpl = (ROOT / "plutus" / "web" / "templates" / "add.html").read_text(encoding="utf-8")
+    assert 'id="save" disabled' in tpl,         "the Save button is clickable before the scan lands, so the review step can be skipped"
+    assert "/api/refresh_status" in tpl, "the page does not poll for scan completion"
+    assert "btn.disabled=false" in tpl, "nothing ever unlocks the button"
+    assert "/api/worksheet" in tpl,         "the worksheet is never re-fetched, so it still shows the pre-scan counts"
 
 if __name__ == "__main__":
     fails = 0
