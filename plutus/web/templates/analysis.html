@@ -75,12 +75,16 @@
 <div class="hdr" id="hdr"></div>
 <div class="bar" id="bar"></div>
 <div class="legend" id="legend"></div>
+<div class="note" id="denom"></div>
 <div class="note" id="ledgernotes"></div>
 </div>
 
 <div class="grid2">
   <div class="card"><h3><span class="live"></span>flow — third party only</h3><div id="flow"></div></div>
-  <div class="card"><h3>float composition</h3><div id="comp"></div></div>
+  <div class="card"><h3>float composition
+    <a id="drill" href="/holders?token_id={{ token_id }}" style="float:right;color:var(--acc);
+       font-size:11px;text-decoration:none;text-transform:none;letter-spacing:0">
+       see every wallet →</a></h3><div id="comp"></div></div>
 </div>
 
 <div class="card key">
@@ -150,16 +154,25 @@ function render(s){
   $('hdr').innerHTML=[
     ['FDV',usd(m.fdv),'acc'],['spot',m.spot?m.spot.toExponential(4):'—',''],
     ['Q · pool depth',usd(m.Q),''],['R · tokens',num(m.R),''],
-    ['our share',pct(L.ours_share),'ours'],['float',pct(L.float_share),'good'],
-    ['ceiling',pct(L.ceiling),'dim'],['holders',num(C.holders),'dim'],
+    ['our share · of tradeable',pct(L.ours_share),'ours'],
+    ['float · of tradeable',pct(L.float_share),'good'],
+    ['ceiling · of tradeable',pct(L.ceiling),'dim'],['holders',num(C.holders),'dim'],
   ].map(([k,v,c])=>`<div><b class="${c==='ours'?'':c}" ${c==='ours'?'style="color:#7a5cd6"':''}>${v}</b><span>${k}</span></div>`).join('');
 
   const seg=[['burnt',L.burnt,'#3d4757'],['ours',L.ours,'#7a5cd6'],['pool',L.pool,'#539bf5'],
              ['locked',L.locked,'#d4a72c'],['float',L.float,'#4cc38a'],['unaccounted',L.unaccounted,'#e5534b']];
   $('bar').innerHTML=seg.map(([n,v,c])=>{const w=100*v/L.nominal;
     return w>0.05?`<div style="width:${w}%;background:${c}">${w>7?n+' '+w.toFixed(1)+'%':''}</div>`:''}).join('');
-  $('legend').innerHTML=seg.map(([n,v,c])=>`<span style="color:${c}">${n} ${pct(v/L.nominal,1)}</span>`).join('')
-    +`<span class="dim">effective ${num(L.effective)}</span>`;
+  $('legend').innerHTML='<span style="color:#8b95a5;border:0;margin-right:4px">bar = share of TOTAL supply:</span>'
+    +seg.map(([n,v,c])=>`<span style="color:${c}">${n} ${pct(v/L.nominal,1)}</span>`).join('');
+  $('denom').innerHTML=`<b>Two denominators, and the page uses both on purpose.</b>
+    The bar above is share of <b>total supply ${num(L.nominal)}</b> — it has to be, because it
+    shows the burnt slice. The figures up top are share of <b>tradeable supply
+    ${num(L.effective)}</b>, which is total minus the ${pct(L.burnt/L.nominal,1)} burnt, because
+    nobody can ever hold burnt tokens. So your position is
+    <b>${pct(L.ours/L.nominal,1)} of everything ever minted</b> and
+    <b class="acc">${pct(L.ours_share,2)} of what can actually be owned</b>. The second is the one
+    that matters for a target.`;
   $('ledgernotes').innerHTML=`${L.ours_holding}/${L.ours_wallets} of our wallets hold · balances ${ago(L.balance_ts)}`
     +L.notes.map(n=>`<br><span class="warn">! ${n}</span>`).join('');
 

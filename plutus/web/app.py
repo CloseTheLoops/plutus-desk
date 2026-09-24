@@ -21,6 +21,7 @@ from plutus import config, db
 from plutus.analyze import advice as A
 from plutus.analyze import composition as C
 from plutus.analyze import flow as F
+from plutus.analyze import holders as H
 from plutus.analyze import ledger as L
 from plutus.analyze.curve import Pool
 from plutus.track import trackers as T
@@ -342,6 +343,37 @@ def api_advice(token_id: int = 1, intent: str = Query("acquire"),
         "intent": adv.intent, "headline": adv.headline, "detail": adv.detail,
         "paths": [vars(p) for p in adv.paths], "numbers": adv.numbers,
         "warnings": adv.warnings, "feasible": adv.feasible, "needs_quote": adv.needs_quote,
+    }, default=_safe)))
+
+
+@app.get("/holders", response_class=HTMLResponse)
+def holders_page(token_id: int = 1) -> HTMLResponse:
+    toks = db.all_tokens()
+    tid = token_id if any(t["id"] == token_id for t in toks) else (toks[0]["id"] if toks else 1)
+    return HTMLResponse(_env.get_template("holders.html").render(
+        token_id=tid, tokens=[dict(t) for t in toks]))
+
+
+@app.get("/api/holders")
+def api_holders(token_id: int = 1, target: float = 0.0) -> JSONResponse:
+    """Every third-party wallet in the float, with cost basis, dormancy and recent activity.
+
+    `target` is a supply share (0.60); when given, the response says how many of the largest
+    holders would cover what that target needs.
+    """
+    pool = _pool(token_id)
+    led = L.build(token_id)
+    spot = pool.spot if pool else 0.0
+    v = H.build(token_id, spot, led.float_, led.nominal)
+    need = led.needed_for(target) if target else 0.0
+    return JSONResponse(json.loads(json.dumps({
+        "spot": spot, "supply": led.nominal, "effective": led.effective,
+        "float_true": v.float_true, "float_seen": v.float_seen, "coverage": v.coverage,
+        "exited": v.exited, "sweep_ts": v.sweep_ts, "active_24h": v.active_24h,
+        "ours_share": led.ours_share, "notes": v.notes,
+        "target": {"share": target, "need_tokens": need,
+                   **(H.reachable_by(v, need) if need else {})},
+        "holders": [vars(h) for h in v.holders],
     }, default=_safe)))
 
 
