@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+*.pyc
+data/*.db
+data/*.db-*
+data/cache/
+.env
+.scratch/
+
+# never commit a real token config or wallet list
+tokens/*.toml
+!tokens/example.toml
+wallets/*.txt
+!wallets/example.txt

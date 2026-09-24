@@ -1,0 +1,35 @@
+# Copy this to tokens/<name>.toml and fill it in, or use the /add page in the browser,
+# which writes the same file for you.
+#
+# You do NOT list pool addresses. Venue discovery finds every pool itself.
+
+[token]
+chain   = "robinhood"          # robinhood / bsc / base / eth / sol
+address = "0x0000000000000000000000000000000000000000"
+label   = "example"
+
+[ours]
+# Wallets you control. Read by DIRECT per-wallet query, never inferred from a ranked
+# holder sweep — a ranked sweep only reaches the top ~100 rows per slice, so smaller
+# wallets of yours are invisible to it. Wallets bound to your API key are added
+# automatically; list here only those that hold but are not bound.
+wallets_file = "wallets/example.txt"
+# wallets = ["0x…", "0x…"]     # or inline
+
+[excluded]
+# Addresses holding supply that is neither yours nor float.
+#
+#   burnt   leaves the denominator ENTIRELY — effective supply is nominal minus burnt.
+#           Launchpad bonding curves often perma-burn at graduation; miss one and every
+#           target you compute is wrong.
+#   locked  staking or vesting. Real supply, not yours, not buyable.
+#   pool    only if venue discovery misses a venue, which it rarely does.
+#
+# An ordinary third-party wallet needs NO entry — float is the residual, so anything
+# not named here is float by definition.
+#
+# "0x…" = "burnt"
+# "0x…" = "locked"
+
+[venues]
+pools = []                      # optional override; discovery fills this in

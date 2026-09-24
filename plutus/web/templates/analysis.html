@@ -1,0 +1,267 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Plutus — analysis</title>
+<style>
+  :root{--bg:#0e1116;--card:#171c24;--ink:#e6e9ee;--dim:#8b95a5;--line:#242b36;
+        --good:#4cc38a;--bad:#e5534b;--warn:#d4a72c;--acc:#539bf5;--ours:#7a5cd6}
+  *{box-sizing:border-box;margin:0}
+  body{background:var(--bg);color:var(--ink);font:14px/1.55 system-ui,Segoe UI,sans-serif;padding:22px 16px 70px}
+  main{max-width:1080px;margin:0 auto}
+  h1{font-size:21px;margin-bottom:2px}
+  .sub{color:var(--dim);font-size:12.5px;margin-bottom:16px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px 18px;margin:12px 0}
+  .card.key{border-color:var(--warn)}.card.hard{border-color:var(--bad)}
+  .card h3{font-size:11.5px;color:var(--dim);text-transform:uppercase;letter-spacing:.06em;margin-bottom:10px;font-weight:600}
+  table{border-collapse:collapse;width:100%;font-size:13px;margin:5px 0}
+  th,td{text-align:left;padding:6px 9px;border-bottom:1px solid var(--line);vertical-align:top}
+  th{color:var(--dim);font-weight:600;font-size:11px;text-transform:uppercase;letter-spacing:.04em}
+  td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
+  tr.hi td{background:#1d2530}
+  .good{color:var(--good)}.bad{color:var(--bad)}.warn{color:var(--warn)}.dim{color:var(--dim)}.acc{color:var(--acc)}
+  code{background:#0a0d12;padding:1px 5px;border-radius:4px;font-size:11.5px}
+  .hdr{display:flex;gap:24px;flex-wrap:wrap;align-items:flex-end}
+  .hdr div{min-width:92px}
+  .hdr b{display:block;font-size:19px;font-variant-numeric:tabular-nums;line-height:1.2}
+  .hdr span{font-size:10px;color:var(--dim);text-transform:uppercase;letter-spacing:.05em}
+  .bar{display:flex;height:26px;border-radius:5px;overflow:hidden;margin:10px 0 6px;font-size:10.5px}
+  .bar div{display:flex;align-items:center;justify-content:center;color:#0e1116;font-weight:700;min-width:0}
+  .legend{display:flex;gap:13px;flex-wrap:wrap;font-size:11px;color:var(--dim)}
+  .legend span::before{content:"■ "}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+  @media(max-width:860px){.grid2{grid-template-columns:1fr}}
+  .live{display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--good);margin-right:6px;animation:p 2s infinite}
+  @keyframes p{0%,100%{opacity:1}50%{opacity:.25}}
+  .regime{padding:9px 13px;border-radius:7px;font-size:13px;font-weight:600;margin:8px 0}
+  .R-STAND_DOWN{background:#2c1614;border:1px solid var(--bad);color:var(--bad)}
+  .R-EXHAUSTING{background:#122a1e;border:1px solid var(--good);color:var(--good)}
+  .R-ACCELERATING{background:#2b2411;border:1px solid var(--warn);color:var(--warn)}
+  .R-FARMED{background:#2c1614;border:1px solid var(--bad);color:var(--bad)}
+  .R-QUIET{background:#0a0d12;border:1px solid var(--line);color:var(--dim)}
+  .why{font-weight:400;font-size:12.5px;display:block;margin-top:4px;opacity:.9}
+  select,input[type=number]{background:#0a0d12;color:var(--ink);border:1px solid var(--line);
+    border-radius:6px;padding:7px 9px;font-size:13px;font-family:inherit;width:100%}
+  label.f{display:block;font-size:10.5px;color:var(--dim);text-transform:uppercase;letter-spacing:.05em;margin-bottom:4px}
+  .ctl{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:11px;margin-bottom:12px}
+  button{background:var(--acc);color:#fff;border:0;border-radius:7px;padding:9px 20px;font-size:13.5px;cursor:pointer;font-family:inherit}
+  .adv{background:#0a0d12;border-left:3px solid var(--acc);border-radius:0 8px 8px 0;padding:12px 15px;margin:10px 0}
+  .adv.bad{border-left-color:var(--bad)}
+  .adv b.t{color:var(--acc);font-size:10.5px;letter-spacing:.05em;text-transform:uppercase;display:block;margin-bottom:5px}
+  .note{font-size:12px;color:var(--dim);margin-top:7px}
+  .note.w{color:var(--warn)}
+  .stale{color:var(--warn);font-size:11.5px}
+  .lens{background:#0a0d12;border-left:3px solid var(--acc);border-radius:0 7px 7px 0;
+    padding:10px 13px;margin:0 0 12px;font-size:13px;line-height:1.55}
+  .target{background:#1a2230;border:1px solid var(--acc);border-radius:7px;
+    padding:10px 13px;margin:12px 0;font-size:13px;line-height:1.6}
+</style>
+</head>
+<body>
+<main>
+<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+  <h1 id="title">Plutus</h1>
+  <select id="tokpick" style="width:auto;padding:5px 9px;font-size:12.5px">
+    {% for t in tokens %}<option value="{{ t.id }}" {% if t.id == token_id %}selected{% endif %}>{{ t.symbol or t.address[:10] }} · {{ t.chain }}</option>{% endfor %}
+  </select>
+  <a href="/add" style="color:var(--acc);font-size:12.5px;text-decoration:none;
+     border:1px solid var(--line);border-radius:6px;padding:5px 11px">+ add token</a>
+</div>
+<div class="sub" id="sub">loading…</div>
+
+<div class="card">
+<h3><span class="live"></span><span id="hdrlab">market</span></h3>
+<div class="hdr" id="hdr"></div>
+<div class="bar" id="bar"></div>
+<div class="legend" id="legend"></div>
+<div class="note" id="ledgernotes"></div>
+</div>
+
+<div class="grid2">
+  <div class="card"><h3><span class="live"></span>flow — third party only</h3><div id="flow"></div></div>
+  <div class="card"><h3>float composition</h3><div id="comp"></div></div>
+</div>
+
+<div class="card key">
+<h3>what do you want?</h3>
+<div class="ctl">
+  <div><label class="f">intent</label><select id="intent">
+    <option value="acquire">Acquire — get me to a supply share</option>
+    <option value="push">Push — take FDV to a level, in a window</option>
+    <option value="event">Event — sell into a catalyst, bid the retrace</option>
+  </select></div>
+  <div><label class="f" id="l1"></label><input type="number" id="p1"></div>
+  <div><label class="f" id="l2"></label><input type="number" id="p2"></div>
+  <div><label class="f" id="l3"></label><input type="number" id="p3"></div>
+</div>
+<button id="ask">Get advice</button>
+<div id="out"></div>
+</div>
+
+<div class="card"><h3>venues</h3><div id="venues"></div></div>
+
+<script>
+const $=id=>document.getElementById(id);
+const usd=n=>n==null?'—':'$'+Math.round(n).toLocaleString('en-US');
+const num=n=>n==null?'—':Math.round(n).toLocaleString('en-US');
+const pct=(n,d=2)=>n==null?'—':(100*n).toFixed(d)+'%';
+const ago=t=>{if(!t)return'never';const s=Math.floor(Date.now()/1000)-t;
+  return s<90?s+'s ago':s<5400?Math.round(s/60)+'m ago':Math.round(s/3600)+'h ago';};
+
+const FIELDS={
+ acquire:[['target share (% of effective)',60,1],['budget (USDG)',25000,1000],['',null,null]],
+ push:[['target FDV ($)',0,1000],['window (minutes)',60,5],['max impact / slice (%)',4,1]],
+ event:[['expected outside buying ($)',5000,500],['max drawdown (%)',15,1],['min follow-through (x)',0.6,0.1]]
+};
+let SNAP=null;
+
+function syncFields(){
+  const f=FIELDS[$('intent').value];
+  for(let i=0;i<3;i++){
+    const lab=$('l'+(i+1)), inp=$('p'+(i+1));
+    if(!f[i][0]){lab.textContent='';inp.style.display='none';lab.style.display='none';continue;}
+    lab.style.display='';inp.style.display='';
+    lab.textContent=f[i][0]; inp.step=f[i][2];
+    if(inp.dataset.intent!==$('intent').value){
+      inp.value=(f[i][1]===0&&SNAP?.market?.fdv)?Math.round(SNAP.market.fdv*1.2):f[i][1];
+      inp.dataset.intent=$('intent').value;
+    }
+  }
+  $('out').innerHTML='';
+}
+$('intent').onchange=syncFields;
+// the composition panel answers "how far do the top wallets get me", so it must follow the
+// target the operator is actually typing rather than a number frozen at page load
+$('p1').addEventListener('input',()=>{ if(SNAP && $('intent').value==='acquire') render(SNAP); });
+
+function render(s){
+  SNAP=s;
+  if(s.error){$('sub').textContent=s.error;return;}
+  const t=s.token,m=s.market,L=s.ledger,F=s.flow,C=s.composition;
+  $('title').textContent=`Plutus — ${t.symbol||'token'}`;
+  $('sub').innerHTML=`${t.chain} · <code>${t.address}</code> · ${t.launchpad||'?'} `
+    +`${t.launch_status||''} · quote ${t.quote||'?'} `
+    +(t.quote_is_stable?'<span class="good">(stable — no FX exposure)</span>':'<span class="warn">(NOT stable — bids carry FX exposure)</span>')
+    +(s.fee.pct?` · measured fee <b>${pct(s.fee.pct,2)}</b>`:' · <span class="warn">fee not calibrated</span>')
+    +(s.build?` · <span class="dim">build ${s.build.rev}${s.build.dirty?'<span class="warn">+dirty</span>':''}
+       · up ${ago(s.build.started)}</span>`:'');
+  $('hdrlab').textContent=`market · observed ${ago(m.observed_ts)}`;
+  $('hdr').innerHTML=[
+    ['FDV',usd(m.fdv),'acc'],['spot',m.spot?m.spot.toExponential(4):'—',''],
+    ['Q · pool depth',usd(m.Q),''],['R · tokens',num(m.R),''],
+    ['our share',pct(L.ours_share),'ours'],['float',pct(L.float_share),'good'],
+    ['ceiling',pct(L.ceiling),'dim'],['holders',num(C.holders),'dim'],
+  ].map(([k,v,c])=>`<div><b class="${c==='ours'?'':c}" ${c==='ours'?'style="color:#7a5cd6"':''}>${v}</b><span>${k}</span></div>`).join('');
+
+  const seg=[['burnt',L.burnt,'#3d4757'],['ours',L.ours,'#7a5cd6'],['pool',L.pool,'#539bf5'],
+             ['locked',L.locked,'#d4a72c'],['float',L.float,'#4cc38a'],['unaccounted',L.unaccounted,'#e5534b']];
+  $('bar').innerHTML=seg.map(([n,v,c])=>{const w=100*v/L.nominal;
+    return w>0.05?`<div style="width:${w}%;background:${c}">${w>7?n+' '+w.toFixed(1)+'%':''}</div>`:''}).join('');
+  $('legend').innerHTML=seg.map(([n,v,c])=>`<span style="color:${c}">${n} ${pct(v/L.nominal,1)}</span>`).join('')
+    +`<span class="dim">effective ${num(L.effective)}</span>`;
+  $('ledgernotes').innerHTML=`${L.ours_holding}/${L.ours_wallets} of our wallets hold · balances ${ago(L.balance_ts)}`
+    +L.notes.map(n=>`<br><span class="warn">! ${n}</span>`).join('');
+
+  const W=F.windows||{};
+  $('flow').innerHTML=`<table>
+    <tr><th>window</th><th class="num">they bought</th><th class="num">they sold</th><th class="num">net</th><th class="num">fills</th><th class="num">was us</th></tr>
+    ${['15m','1h','24h'].map(k=>{const w=W[k]; if(!w)return'';
+      return `<tr class="${k===F.regime_window?'hi':''}"><td>${k}${k===F.regime_window?' <span class="dim">← regime</span>':''}</td>
+      <td class="num">${usd(w.third_buy)}</td><td class="num">${usd(w.third_sell)}</td>
+      <td class="num ${w.third_net>0?'good':(w.third_net<0?'bad':'dim')}">${w.third_net>0?'+':''}${usd(w.third_net)}</td>
+      <td class="num ${w.fills?'':'dim'}">${w.fills}</td>
+      <td class="num ${w.our_share>0.15?'warn':'dim'}">${w.fills?pct(w.our_share,0):'—'}</td></tr>`}).join('')}
+    </table>
+    <div class="note">Buy/sell are <b>third-party only</b> — our own fills are stripped at ingest.
+    "was us" is the share of that window's volume that came from our own wallets; a raw chart would
+    add it back in and read the market as more bid than it is.</div>
+    <table><tr><td>sell trend</td><td class="num">${F.sell_trend.toFixed(2)}</td></tr>
+    <tr><td>price rank (24h)</td><td class="num">${F.price_rank.toFixed(2)}</td></tr>
+    <tr><td>top maker share</td><td class="num ${F.top_maker_share>=.25?'bad':''}">${pct(F.top_maker_share,1)}</td></tr>
+    <tr><td>capture rate</td><td class="num">${F.capture==null?'<span class="dim">no supply offered</span>':pct(F.capture,1)}</td></tr>
+    <tr><td>fills in window</td><td class="num">${F.fills}</td></tr></table>
+    <div class="regime R-${F.regime}">${F.regime.replace('_',' ')} — ${F.action}<span class="why">${F.why}</span></div>
+    ${F.notes.map(n=>`<div class="note w">! ${n}</div>`).join('')}`;
+
+  const tgtPct=Math.max(0,Math.min(100,+($('p1')?.value)||60))/100;
+  const needT=Math.max(0,tgtPct*L.effective-L.ours);
+  const top5T=(C.concentration?.['5']||0)*C.float_true;
+  const top15T=(C.concentration?.['15']||0)*C.float_true;
+
+  $('comp').innerHTML=(C.segments.length?`
+    <div class="lens">Of <b>${num(L.nominal)}</b> supply, only <b>${num(L.float)}</b>
+      — <b>${pct(L.float/L.nominal,0)}</b> — can actually trade.<br>
+      <span class="dim">The rest is your ${pct(L.ours/L.nominal,0)}, the pool's
+      ${pct(L.pool/L.nominal,0)}, staking ${pct(L.locked/L.nominal,0)} and
+      ${pct(L.burnt/L.nominal,0)} burnt. <b>That ${num(L.float)} is "the float", and every
+      percentage below is a share of it — not of supply.</b></span></div>
+
+    <table>
+    <tr><th>who holds the float</th><th class="num">tokens</th><th class="num">of float</th><th class="num">of supply</th></tr>
+    ${Object.entries(C.concentration).map(([n,v])=>{const tk=v*C.float_true;
+      return `<tr class="${n==='5'?'hi':''}"><td>top ${n} wallets</td>
+      <td class="num">${num(tk)}</td><td class="num"><b>${pct(v,1)}</b></td>
+      <td class="num dim">${pct(tk/L.nominal,2)}</td></tr>`}).join('')}
+    <tr><td class="dim">all ${C.holders} of them</td><td class="num dim">${num(C.float_true)}</td>
+      <td class="num dim">100%</td><td class="num dim">${pct(L.float/L.nominal,1)}</td></tr>
+    </table>
+
+    ${needT>0?`<div class="target">To reach <b>${pct(tgtPct,0)}</b> you need
+      <b>${num(needT)}</b> tokens.<br>
+      The top 5 wallets hold <b>${num(top5T)}</b> — <b class="${top5T>=needT?'good':'warn'}">${
+        pct(top5T/needT,0)}</b> of the whole job. The top 15 hold ${pct(top15T/needT,0)}.
+      <span class="dim">At spot that top-5 block marks at ${usd(top5T*(m.spot||0))}.</span></div>`:''}
+
+    <table>
+    <tr><th>segment</th><th class="num">wallets</th><th class="num">of float</th></tr>
+    ${C.segments.map(x=>`<tr class="${x.wallets===0?'dim':''}"><td>${x.name}</td>
+      <td class="num">${x.wallets||'—'}</td><td class="num">${pct(x.share_of_float,1)}</td></tr>`).join('')}
+    </table>`
+    :'<div class="dim">no census yet</div>')
+    +`<div class="note">${C.holders} third-party wallets holding · ${C.exited} fully exited · swept ${ago(C.sweep_ts)}
+      ${C.coverage<0.99?`<br><span class="warn">census reached ${pct(C.coverage,1)} of the float
+      (${num(C.float_true-C.float_seen)} tokens sit below every slice's cutoff)</span>`:''}</div>`
+    +C.notes.map(n=>`<div class="note w">! ${n}</div>`).join('');
+
+  $('venues').innerHTML=`<table><tr><th>pool</th><th>dex</th><th class="num">reserve</th><th class="num">vol24</th></tr>`
+    +m.venues.slice(0,5).map(v=>`<tr class="${v.is_primary?'hi':''}"><td><code>${(v.pool_address||'').slice(0,18)}…</code></td>
+      <td>${v.dex||''}</td><td class="num">${usd(v.reserve_usd)}</td><td class="num">${usd(v.vol24)}</td></tr>`).join('')
+    +`</table><div class="note">${m.venues.length} venues · ${m.dust_venues} are dust, polled for migration only</div>`;
+  syncFields();
+}
+
+async function refresh(){
+  try{const r=await fetch('/api/snapshot?token_id={{ token_id }}');render(await r.json());}
+  catch(e){$('sub').innerHTML='<span class="bad">snapshot failed — is the tracker running?</span>';}
+}
+
+$('ask').onclick=async()=>{
+  const i=$('intent').value;
+  const q=new URLSearchParams({token_id:'{{ token_id }}',intent:i,
+    p1:$('p1').value||0,p2:$('p2').value||0,p3:$('p3').value||0});
+  $('out').innerHTML='<div class="note">computing…</div>';
+  const r=await fetch('/api/advice?'+q); const a=await r.json();
+  if(a.error){$('out').innerHTML=`<div class="adv bad">${a.error}</div>`;return;}
+  let h=`<div class="adv ${a.feasible?'':'bad'}"><b class="t">${a.intent}</b>
+    <div style="font-size:15px;font-weight:600;margin-bottom:6px">${a.headline}</div>
+    <div>${a.detail.replace(/\*\*(.+?)\*\*/g,'<b>$1</b>')}</div>`;
+  if(a.paths&&a.paths.length){
+    h+=`<table style="margin-top:10px"><tr><th>path</th><th class="num">cost</th><th class="num">avg px</th>
+      <th class="num">spot ends</th><th class="num">time</th></tr>`
+      +a.paths.map(p=>`<tr class="${p.recommended?'hi':''}">
+        <td>${p.recommended?'<b class="good">▸ </b>':''}${p.name}<div class="note">${p.note}</div></td>
+        <td class="num">${usd(p.cost)}</td><td class="num">${p.avg_price_x==null?'—':p.avg_price_x.toFixed(2)+'x'}</td>
+        <td class="num">${p.end_price_x==null?'—':p.end_price_x.toFixed(2)+'x'}</td>
+        <td class="num">${p.days==null?'—':(p.days<1?'<1d':Math.round(p.days)+'d')}</td></tr>`).join('')+`</table>`;
+  }
+  h+=a.warnings.map(w=>`<div class="note w">! ${w}</div>`).join('')+`</div>`;
+  $('out').innerHTML=h;
+};
+
+$('tokpick').onchange=()=>{location.href='/?token_id='+$('tokpick').value;};
+refresh(); setInterval(refresh,30000);
+</script>
+</main>
+</body>
+</html>

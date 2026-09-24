@@ -1,0 +1,2 @@
+# One address per line. Paste straight from a spreadsheet — quotes, tabs, CRLF,
+# header rows and invisible characters are all handled.
