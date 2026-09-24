@@ -35,6 +35,7 @@ CONTEXTS = {
     "analysis.html": dict(token_id=1, tokens=[{"id": 1, "symbol": "TOK",
                                                "chain": "robinhood",
                                                "address": "0x" + "a" * 40}]),
+    "campaign.html": dict(cid=1, token_id=1, kind="push"),
     "holders.html": dict(token_id=1, tokens=[{"id": 1, "symbol": "TOK",
                                               "chain": "robinhood",
                                               "address": "0x" + "a" * 40}]),

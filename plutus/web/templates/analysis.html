@@ -53,6 +53,8 @@
   .note{font-size:12px;color:var(--dim);margin-top:7px}
   .note.w{color:var(--warn)}
   .stale{color:var(--warn);font-size:11.5px}
+  .help{font-size:11px;color:var(--dim);margin-top:5px;line-height:1.45}
+  .help b{color:#b9c2cf}
   .lens{background:#0a0d12;border-left:3px solid var(--acc);border-radius:0 7px 7px 0;
     padding:10px 13px;margin:0 0 12px;font-size:13px;line-height:1.55}
   .target{background:#1a2230;border:1px solid var(--acc);border-radius:7px;
@@ -112,13 +114,18 @@
   <div><label class="f">intent</label><select id="intent">
     <option value="acquire">Acquire — get me to a supply share</option>
     <option value="push">Push — take FDV to a level, in a window</option>
-    <option value="event">Event — sell into a catalyst, bid the retrace</option>
+    <option value="distribute">Distribute — sell into a catalyst as it happens</option>
   </select></div>
-  <div><label class="f" id="l1"></label><input type="number" id="p1"></div>
-  <div><label class="f" id="l2"></label><input type="number" id="p2"></div>
-  <div><label class="f" id="l3"></label><input type="number" id="p3"></div>
+  <div><label class="f" id="l1"></label><input type="number" id="p1">
+    <div class="help" id="h1"></div></div>
+  <div><label class="f" id="l2"></label><input type="number" id="p2">
+    <div class="help" id="h2"></div></div>
+  <div><label class="f" id="l3"></label><input type="number" id="p3">
+    <div class="help" id="h3"></div></div>
 </div>
-<button id="ask">Get advice</button>
+<button id="ask">Show me what this costs</button>
+<button id="start" style="background:#0a0d12;border:1px solid var(--good);color:var(--good);margin-left:8px">
+  Start campaign &amp; watch it live →</button>
 <div id="out"></div>
 </div>
 
@@ -132,10 +139,32 @@ const pct=(n,d=2)=>n==null?'—':(100*n).toFixed(d)+'%';
 const ago=t=>{if(!t)return'never';const s=Math.floor(Date.now()/1000)-t;
   return s<90?s+'s ago':s<5400?Math.round(s/60)+'m ago':Math.round(s/3600)+'h ago';};
 
+// Plain questions, and each one says what it DOES. The old labels were jargon the operator
+// had to already understand ("max impact / slice", "min follow-through"), and one of them —
+// "expected outside buying" — asked for the single number nobody can know in advance.
 const FIELDS={
- acquire:[['target share (% of effective)',60,1],['budget (USDG)',25000,1000],['',null,null]],
- push:[['target FDV ($)',0,1000],['window (minutes)',60,5],['max impact / slice (%)',4,1]],
- event:[['expected outside buying ($)',5000,500],['max drawdown (%)',15,1],['min follow-through (x)',0.6,0.1]]
+ acquire:[
+  ['How much of the tradeable supply do you want to end up holding?',60,1,
+   'You hold <b id="curShare">—</b> now. This is the finishing line, not the amount to buy.'],
+  ['How much are you willing to spend getting there?',25000,1000,
+   'A hard cap. If the target costs more than this, it says so rather than starting.'],
+  ['',null,null,'']],
+ push:[
+  ['Where do you want the price to get to? (FDV in $)',0,1000,
+   'Now: <b id="curFdv">—</b>. FDV is price × total supply, so this is just the price in a bigger unit.'],
+  ['Over how long? (minutes)',60,5,
+   'The buying is split across this window instead of hitting at once. Longer is cheaper and less obvious.'],
+  ['How much may any single buy move the price? (%)',4,1,
+   'The program is cut into slices. This caps how violent each one is — a big slice pays more '
+   +'for its own impact and prints a candle anyone can see.']],
+ distribute:[
+  ['What share of incoming buying will you take? (%)',35,5,
+   '<b>The whole dial.</b> Take 25% and the rally keeps running while you sell; take 100% and '
+   +'you cancel the buying entirely and kill the move with inventory still unsold.'],
+  ['Sell at most how much of your holdings? (%)',10,1,
+   'A hard cap so a run-away catalyst cannot distribute more than you meant.'],
+  ['Never sell below this price (0 = no floor)',0,0.00001,
+   'A price, not a percentage. Below it, the desk stops selling regardless of demand.']]
 };
 let SNAP=null;
 
@@ -148,7 +177,8 @@ function syncFields(){
     const lab=$('l'+(i+1)), inp=$('p'+(i+1));
     if(!f[i][0]){lab.textContent='';inp.style.display='none';lab.style.display='none';continue;}
     lab.style.display='';inp.style.display='';
-    lab.textContent=f[i][0]; inp.step=f[i][2];
+    lab.innerHTML=f[i][0]; inp.step=f[i][2];
+    const h=$('h'+(i+1)); if(h) h.innerHTML=f[i][3]||'';
     if(inp.dataset.intent!==$('intent').value){
       inp.value=(f[i][1]===0&&SNAP?.market?.fdv)?Math.round(SNAP.market.fdv*1.2):f[i][1];
       inp.dataset.intent=$('intent').value;
@@ -161,7 +191,7 @@ $('intent').onchange=syncFields;
 // target the operator is actually typing rather than a number frozen at page load
 $('p1').addEventListener('input',()=>{ if(SNAP && $('intent').value==='acquire') render(SNAP); });
 
-function render(s){
+let render=function render(s){
   SNAP=s;
   if(s.error){$('sub').textContent=s.error;return;}
   const t=s.token,m=s.market,L=s.ledger,F=s.flow,C=s.composition;
@@ -272,7 +302,7 @@ function render(s){
       <td>${v.dex||''}</td><td class="num">${usd(v.reserve_usd)}</td><td class="num">${usd(v.vol24)}</td></tr>`).join('')
     +`</table><div class="note">${m.venues.length} venues · ${m.dust_venues} are dust, polled for migration only</div>`;
   syncFields();
-}
+};
 
 async function refresh(){
   // A throw anywhere inside render() leaves the page blank and silent, because the exception
@@ -365,6 +395,27 @@ async function poll(){
 }
 
 const reload=refresh;
+$('start').onclick=async()=>{
+  const i=$('intent').value;
+  const params = i==='acquire' ? {target_share:(+$('p1').value||60)/100, budget:+$('p2').value||0}
+    : i==='push' ? {target_fdv:+$('p1').value||0, minutes:+$('p2').value||60,
+                    max_impact:(+$('p3').value||4)/100}
+    : {participation:(+$('p1').value||35)/100, sell_pct:+$('p2').value||10,
+       floor_price:+$('p3').value||0};
+  $('out').innerHTML='<div class="note">starting…</div>';
+  const r=await (await fetch('/api/campaign',{method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({token_id:{{ token_id }},kind:i,params})})).json();
+  if(r.error){$('out').innerHTML='<div class="adv bad">'+r.error+'</div>';return;}
+  location.href=r.url;
+};
+// keep the "you hold X now" hints live
+const _oldRender=render;
+render=function(s){ _oldRender(s);
+  const a=$('curShare'), b=$('curFdv');
+  if(a) a.textContent=pct(s.ledger.ours_share,2);
+  if(b) b.textContent=usd(s.market.fdv);
+};
 refresh(); setInterval(refresh,30000);
 </script>
 </main>

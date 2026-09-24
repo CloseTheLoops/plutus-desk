@@ -21,6 +21,8 @@ from plutus import config, db
 from plutus.analyze import advice as A
 from plutus.analyze import composition as C
 from plutus.analyze import flow as F
+from plutus.analyze import campaign as CP
+from plutus.analyze import distribute as D
 from plutus.analyze import holders as H
 from plutus.analyze import ledger as L
 from plutus.analyze.curve import Pool
@@ -350,9 +352,29 @@ def api_advice(token_id: int = 1, intent: str = Query("acquire"),
     elif intent == "push":
         adv = A.push(pool, led.nominal, p1, int(p2 or 60),
                      max_impact=(p3 or 4) / 100.0, accurate_to=accurate_to)
-    elif intent == "event":
-        adv = A.event(pool, p1, (p2 or 15) / 100.0, follow_through_floor=p3 or 0.6,
-                      our_push=p1 / 5 if p1 else 0)
+    elif intent == "distribute":
+        # p1 = participation % · p2 = sell at most, % of holdings · p3 = floor price (0 = none)
+        led2 = L.build(token_id)
+        cap = (p2 / 100.0) * led2.ours if p2 else 0.0
+        st = D.Settings(participation=max(0.01, min(1.5, (p1 or 35) / 100.0)),
+                        floor_price=p3 or 0.0, max_sell_tokens=cap)
+        fl = F.measure(token_id, 900)
+        sold = db.connect().execute(
+            """SELECT COALESCE(SUM(tokens),0) t, COALESCE(SUM(usd),0) u FROM trades
+               WHERE token_id=? AND is_ours=1 AND side='sell' AND ts>=?""",
+            (token_id, db.now() - 86400)).fetchone()
+        peak = db.connect().execute(
+            "SELECT MAX(price) p FROM trades WHERE token_id=? AND ts>=? AND price>0",
+            (token_id, db.now() - 86400)).fetchone()["p"] or pool.spot
+        plan = D.decide(pool, st, inflow_usd=max(0.0, fl.third_net), price_peak=peak,
+                        already_sold_tokens=sold["t"] or 0.0,
+                        already_sold_usd=sold["u"] or 0.0)
+        return JSONResponse(json.loads(json.dumps({
+            "intent": "distribute", "plan": vars(plan),
+            "preview": D.preview(pool, st),
+            "dial": D.participation_curve(pool, 20_000, led2.ours),
+            "settings": vars(st), "holdings": led2.ours, "spot": pool.spot,
+        }, default=_safe)))
     else:
         return JSONResponse({"error": f"unknown intent {intent}"}, status_code=400)
 
@@ -449,6 +471,61 @@ async def api_refresh(token_id: int = 1, full: bool = False) -> JSONResponse:
 @app.get("/api/refresh")
 def api_refresh_status(token_id: int = 1) -> JSONResponse:
     return JSONResponse(_jobs.get(token_id, {"running": False, "stage": None}))
+
+
+@app.post("/api/campaign")
+async def api_campaign_create(payload: dict = Body(...)) -> JSONResponse:
+    """Turn an intent into something that runs and is watched."""
+    tid = int(payload.get("token_id") or 1)
+    kind = payload.get("kind")
+    if kind not in ("acquire", "push", "distribute"):
+        return JSONResponse({"error": f"unknown kind {kind!r}"}, status_code=400)
+    pool = _pool(tid)
+    if pool is None:
+        return JSONResponse({"error": "no pool observation yet"}, status_code=409)
+    led = L.build(tid)
+    params = dict(payload.get("params") or {})
+    minutes = int(params.get("minutes") or 0) or None
+    if kind == "distribute" and params.get("sell_pct"):
+        params["max_sell_tokens"] = float(params["sell_pct"]) / 100.0 * led.ours
+    cid = CP.create(tid, kind, params, pool, led, minutes)
+    return JSONResponse({"id": cid, "url": f"/campaign/{cid}"})
+
+
+@app.get("/api/campaign/{cid}")
+def api_campaign_status(cid: int) -> JSONResponse:
+    c = CP.get(cid)
+    if not c:
+        return JSONResponse({"error": "no such campaign"}, status_code=404)
+    pool = _pool(c["token_id"])
+    if pool is None:
+        return JSONResponse({"error": "no pool observation yet"}, status_code=409)
+    st = CP.status(cid, pool, L.build(c["token_id"]))
+    d = vars(st)
+    d["step"] = vars(st.step)
+    d["token_id"] = c["token_id"]
+    return JSONResponse(json.loads(json.dumps(d, default=_safe)))
+
+
+@app.post("/api/campaign/{cid}/stop")
+def api_campaign_stop(cid: int) -> JSONResponse:
+    CP.stop(cid)
+    return JSONResponse({"stopped": cid})
+
+
+@app.get("/api/campaigns")
+def api_campaigns(token_id: int = 1) -> JSONResponse:
+    return JSONResponse(json.loads(json.dumps(CP.listing(token_id), default=_safe)))
+
+
+@app.get("/campaign/{cid}", response_class=HTMLResponse)
+def campaign_page(cid: int) -> HTMLResponse:
+    c = CP.get(cid)
+    if not c:
+        return HTMLResponse("<p style='font:15px system-ui;padding:40px'>No such campaign. "
+                            "<a href='/' style='color:#539bf5'>back</a></p>", status_code=404)
+    return HTMLResponse(_env.get_template("campaign.html").render(
+        cid=cid, token_id=c["token_id"], kind=c["kind"]))
 
 
 @app.get("/api/worksheet")
