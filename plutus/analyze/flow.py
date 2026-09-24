@@ -32,7 +32,8 @@ class Flow:
     our_sell: float = 0.0
     our_fills: int = 0
     sigma: float = 0.0              # realised vol over the window, from fill prices
-    sell_trend: float = 1.0         # recent sell flow vs the preceding stretch
+    sell_trend: float | None = 1.0  # recent sell flow vs the preceding stretch; None = unknown
+    trend_basis_h: float = 0.0      # hours of tape the baseline actually had
     top_maker: str = ""
     top_maker_share: float = 0.0
     price_rank: float = 0.5         # where spot sits in its own 24h range, 0 = at the low
@@ -67,6 +68,11 @@ REGIMES = {
     "STAND_DOWN":   ("hold the deep rungs, spend nothing",
                      "Net buying into the top of the range. Supply is not on offer, and anything "
                      "taken here is taken at the expensive end of the curve."),
+    "SUPPLY_OFFERED": ("bid, but size it cautiously",
+                     "Sells dominate and price is at the low end of its range — supply IS on "
+                     "offer, which is what you want. What cannot be told yet is whether the "
+                     "flow is still building or already fading, so this is a smaller bid than "
+                     "a confirmed exhaustion would justify."),
     "QUIET":        ("rest the normal ladder",
                      "Both flows thin. The quotes cost nothing to leave up and a surprise seller "
                      "hits them."),
@@ -122,13 +128,35 @@ def measure(token_id: int, window_s: int = 900, our: set[str] | None = None) -> 
         if len(rets) >= 2:
             f.sigma = statistics.pstdev(rets)
 
-    # sell trend: this window against the three preceding ones, third-party only
-    prev = conn.execute(
-        """SELECT COALESCE(SUM(usd),0) s FROM trades
-           WHERE token_id=? AND ts>=? AND ts<? AND side='sell' AND is_ours=0""",
-        (token_id, lo - 3 * window_s, lo)).fetchone()["s"] or 0.0
-    prev_rate = prev / 3.0
-    f.sell_trend = (f.third_sell / prev_rate) if prev_rate > 0 else (1.0 if f.third_sell == 0 else 2.0)
+    # Sell trend: this window against the three preceding ones, third-party only.
+    #
+    # IT ONLY MEANS ANYTHING IF THE BASELINE WINDOW IS ACTUALLY COVERED BY TAPE. Dividing by a
+    # window we have barely any data for produces a huge ratio out of nothing: with 30h of tape
+    # stored and a 24h window, the "prior 72h" is ~6h of real data and ~66h of silence, which
+    # read as a near-zero baseline and returned 18.18 — an artifact of missing history that
+    # looks exactly like a sell wave. Unknown is reported as unknown.
+    base_from, base_to = lo - 3 * window_s, lo
+    earliest = conn.execute("SELECT MIN(ts) t FROM trades WHERE token_id=?",
+                            (token_id,)).fetchone()["t"]
+    covered_from = max(base_from, earliest or base_to)
+    f.trend_basis_h = max(0.0, (base_to - covered_from) / 3600.0)
+    covered_frac = (base_to - covered_from) / (base_to - base_from) if base_to > base_from else 0.0
+
+    if covered_frac < 0.5:
+        f.sell_trend = None
+        f.notes.append(
+            f"sell trend unavailable — the baseline needs {3*window_s/3600:.0f}h of tape before "
+            f"this window and only {f.trend_basis_h:.1f}h exists. It will become meaningful once "
+            f"the tape is deep enough; until then a ratio here would be measuring our own "
+            f"collection gap, not the market.")
+    else:
+        prev = conn.execute(
+            """SELECT COALESCE(SUM(usd),0) s FROM trades
+               WHERE token_id=? AND ts>=? AND ts<? AND side='sell' AND is_ours=0""",
+            (token_id, covered_from, base_to)).fetchone()["s"] or 0.0
+        # rate over the span we actually have, not over the span we asked for
+        rate = prev / max(1e-9, (base_to - covered_from) / window_s)
+        f.sell_trend = (f.third_sell / rate) if rate > 0 else (1.0 if f.third_sell == 0 else None)
 
     # price rank in the 24h range
     day = conn.execute(
@@ -137,8 +165,17 @@ def measure(token_id: int, window_s: int = 900, our: set[str] | None = None) -> 
     last = conn.execute(
         "SELECT price FROM trades WHERE token_id=? AND price>0 ORDER BY ts DESC LIMIT 1",
         (token_id,)).fetchone()
-    if day and last and day["hi"] and day["lo"] is not None and day["hi"] > day["lo"]:
+    n_px = conn.execute(
+        "SELECT COUNT(DISTINCT price) n FROM trades WHERE token_id=? AND ts>=? AND price>0",
+        (token_id, now - 86400)).fetchone()["n"]
+    if (day and last and day["hi"] and day["lo"] is not None
+            and day["hi"] > day["lo"] and n_px >= 5):
         f.price_rank = (float(last["price"]) - day["lo"]) / (day["hi"] - day["lo"])
+    else:
+        f.price_rank = 0.5      # not enough distinct prices to locate spot in a range
+        if n_px < 5:
+            f.notes.append(f"price rank is a placeholder — only {n_px} distinct fill prices in "
+                           f"24h, which is too few to say where spot sits in a range")
 
     if f.our_share_of_volume > 0.15:
         f.notes.append(
@@ -155,12 +192,18 @@ def regime(f: Flow) -> tuple[str, str, str]:
         r = "FARMED"
     elif f.fills < 4:
         r = "QUIET"
-    elif f.third_sell > 0 and f.sell_trend >= ACCELERATING_AT:
+    elif f.sell_trend is not None and f.third_sell > 0 and f.sell_trend >= ACCELERATING_AT:
         r = "ACCELERATING"
-    elif f.third_sell > 0 and f.sell_trend <= EXHAUSTING_AT and f.price_rank <= 0.5:
+    elif (f.sell_trend is not None and f.third_sell > 0
+          and f.sell_trend <= EXHAUSTING_AT and f.price_rank <= 0.5):
         r = "EXHAUSTING"
     elif f.third_net > 0 and f.price_rank >= 0.7:
         r = "STAND_DOWN"
+    elif f.third_sell > 0 and f.third_net < 0 and f.price_rank <= 0.35:
+        # Net selling into the low end of the range. Without a trend we cannot say whether it is
+        # building or fading, but "supply is on offer and cheap" is already actionable, and
+        # calling it QUIET because one input is missing would throw away the part we DO know.
+        r = "SUPPLY_OFFERED"
     else:
         r = "QUIET"
     action, why = REGIMES[r]

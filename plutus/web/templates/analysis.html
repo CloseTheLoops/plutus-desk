@@ -40,6 +40,7 @@
   .R-ACCELERATING{background:#2b2411;border:1px solid var(--warn);color:var(--warn)}
   .R-FARMED{background:#2c1614;border:1px solid var(--bad);color:var(--bad)}
   .R-QUIET{background:#0a0d12;border:1px solid var(--line);color:var(--dim)}
+  .R-SUPPLY_OFFERED{background:#122a1e;border:1px solid var(--good);color:var(--good)}
   .why{font-weight:400;font-size:12.5px;display:block;margin-top:4px;opacity:.9}
   select,input[type=number]{background:#0a0d12;color:var(--ink);border:1px solid var(--line);
     border-radius:6px;padding:7px 9px;font-size:13px;font-family:inherit;width:100%}
@@ -209,8 +210,9 @@ function render(s){
     "was us" is the share of that window's volume that came from our own wallets; a raw chart would
     add it back in and read the market as more bid than it is.</div>
     <table><tr><td>sell trend</td><td class="num">${F.sell_trend.toFixed(2)}</td></tr>
-    <tr><td>price rank (24h)</td><td class="num">${F.price_rank.toFixed(2)}</td></tr>
-    <tr><td>top maker share</td><td class="num ${F.top_maker_share>=.25?'bad':''}">${pct(F.top_maker_share,1)}</td></tr>
+    <tr><td>price rank <span class="dim">0 = at the 24h low</span></td><td class="num">${F.price_rank.toFixed(2)}</td></tr>
+    <tr><td>top maker share <span class="dim">alarm at 25%</span></td><td class="num ${
+      F.top_maker_share>=.25?'bad':''}">${pct(F.top_maker_share,1)}</td></tr>
     <tr><td>capture rate</td><td class="num">${F.capture==null?'<span class="dim">no supply offered</span>':pct(F.capture,1)}</td></tr>
     <tr><td>fills in window</td><td class="num">${F.fills}</td></tr></table>
     <div class="regime R-${F.regime}">${F.regime.replace('_',' ')} — ${F.action}<span class="why">${F.why}</span></div>

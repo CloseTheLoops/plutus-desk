@@ -89,16 +89,27 @@ def trades(network: str, pool: str, quick: bool = False) -> list[dict]:
     out = []
     for r in (d or {}).get("data") or []:
         a = r.get("attributes") or {}
-        ts = a.get("block_timestamp")
+        kind = a.get("kind")
+        usd = _f(a.get("volume_in_usd"))
+        frm, to = _f(a.get("from_token_amount")), _f(a.get("to_token_amount"))
+        # THE BASE TOKEN'S amount is whichever side is not the quote asset: on a buy the trader
+        # RECEIVES the token, on a sell they SEND it.
+        base_amt = to if kind == "buy" else frm
+        # Price derived as usd/base_amount, NOT from price_to_in_usd. That field is the price of
+        # whatever the trader received, so on a sell it is the STABLECOIN — ~$1.00 — and storing
+        # it as the token price puts a 1.0 next to a 0.0001 in the same column. Every statistic
+        # over that column (24h range, realised volatility, price rank) then reads as noise.
+        price = (usd / base_amt) if base_amt else 0.0
         out.append({
             "tx_hash": a.get("tx_hash"),
-            "ts": _iso(ts),
-            "side": a.get("kind"),
-            "usd": _f(a.get("volume_in_usd")),
+            "ts": _iso(a.get("block_timestamp")),
+            "side": kind,
+            "usd": usd,
             "maker": (a.get("tx_from_address") or "").strip(),
-            "from_amount": _f(a.get("from_token_amount")),
-            "to_amount": _f(a.get("to_token_amount")),
-            "price_usd": _f(a.get("price_to_in_usd")) or _f(a.get("price_from_in_usd")),
+            "from_amount": frm,
+            "to_amount": to,
+            "base_amount": base_amt,
+            "price_usd": price,
         })
     return out
 

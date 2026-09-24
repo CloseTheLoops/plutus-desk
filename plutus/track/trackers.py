@@ -76,7 +76,8 @@ def track_tape(token_id: int) -> TickResult:
         is_ours = maker in ours
         mine += is_ours
         rows.append((token_id, f["tx_hash"], 0, primary, f["ts"], f["side"],
-                     f["usd"], f["to_amount"] if f["side"] == "buy" else f["from_amount"],
+                     f["usd"], f.get("base_amount") or
+                     (f["to_amount"] if f["side"] == "buy" else f["from_amount"]),
                      f["price_usd"], maker, int(is_ours), "geckoterminal"))
     new = db.record_trades(rows)
     return TickResult("tape", True, 1, time.time() - t0,
