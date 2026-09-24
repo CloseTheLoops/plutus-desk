@@ -119,8 +119,47 @@ def cmd_worksheet(a) -> None:
               f"any target. Add them to the token's [excluded] table or the wallets file.")
 
 
+def cmd_setpassword(a) -> None:
+    """Set the admin password that guards every state-changing endpoint.
+
+    Read from a prompt or PLUTUS_ADMIN_PASSWORD, never from a command-line argument -- an
+    argument lands in shell history and in the process list where other users can see it.
+    """
+    import getpass
+    import os
+
+    from plutus.web import auth
+
+    pw = os.environ.get("PLUTUS_ADMIN_PASSWORD") or ""
+    if not pw:
+        pw = getpass.getpass("new admin password: ")
+        if pw != getpass.getpass("confirm: "):
+            print("  they do not match")
+            raise SystemExit(2)
+    try:
+        auth.set_password(pw)
+    except ValueError as exc:
+        print(f"  {exc}")
+        raise SystemExit(2) from None
+    print(f"  admin password set. Stored as a scrypt hash in {auth.PATH}")
+    print("  That file is gitignored and must stay out of the repository.")
+
+
 def cmd_serve(a) -> None:
+    import os
+
     import uvicorn
+
+    # The app has to know what it bound to. "A request from 127.0.0.1 is the operator" is true
+    # only when nothing can sit in front of the server -- and behind a reverse proxy, every
+    # request arrives from 127.0.0.1.
+    os.environ["PLUTUS_BIND_HOST"] = a.host
+    if a.host not in ("127.0.0.1", "::1", "localhost") and not os.environ.get("PLUTUS_KEY"):
+        print()
+        print(f"  WARNING: serving on {a.host} with no PLUTUS_KEY set.")
+        print("  Everyone who can reach this port - including you - gets a read-only view.")
+        print("  Set PLUTUS_KEY first, then open the page once with ?k=<your key>.")
+        print()
     uvicorn.run("plutus.web.app:app", host=a.host, port=a.port, log_level="info")
 
 
@@ -259,6 +298,9 @@ def main() -> None:
     d = sub.add_parser("doctor", help="why are the balances zero?")
     d.add_argument("token", nargs="?"); d.add_argument("--chain", default="robinhood")
     d.set_defaults(fn=cmd_doctor)
+
+    sp = sub.add_parser("setpassword", help="set the admin password for the web UI")
+    sp.set_defaults(fn=cmd_setpassword)
 
     s = sub.add_parser("serve"); s.add_argument("--host", default="127.0.0.1")
     s.add_argument("--port", type=int, default=8800); s.set_defaults(fn=cmd_serve)

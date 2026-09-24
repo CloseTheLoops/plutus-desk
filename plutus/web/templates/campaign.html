@@ -306,22 +306,44 @@ $('stop').onclick=async()=>{
   await fetch('/api/campaign/{{ cid }}/stop',{method:'POST'});
   load();
 };
-// ── viewer mode ──────────────────────────────────────────────────────────────
-// Everyone who can reach this port can read. Only the operator can change anything, and the
-// server enforces that. This just hides the controls a viewer would be refused for using --
-// a delete button that always errors is worse than no delete button.
+// ── admin login ──────────────────────────────────────────────────────────────
+// Reading is open; changing anything needs the admin password. The server enforces that, so
+// this is only the affordance: hide the controls a viewer would be refused for using, and give
+// the operator somewhere to log in. A button that always errors is worse than no button.
 async function applyRole(ids){
-  try{
-    const w = await (await fetch('/api/whoami')).json();
-    if(w && w.operator) return;
-    ids.forEach(id => { const e = document.getElementById(id); if(e) e.style.display='none'; });
-    const b = document.createElement('div');
-    b.textContent = 'read-only view — you can watch, but not change anything';
-    b.style.cssText = 'font:12.5px system-ui;color:#8a8f98;border:1px solid #2a2f38;'
-      + 'border-radius:6px;padding:5px 11px;display:inline-block;margin-left:auto';
-    const h = document.querySelector('main > div') || document.body;
-    h.appendChild(b);
-  }catch(e){ /* if the probe fails, leave the page as it is; the server still refuses */ }
+  let w = {operator:true};
+  try{ w = await (await fetch('/api/whoami')).json(); }catch(e){ return; }
+  if(w && w.operator) return;
+  ids.forEach(id => { const e=document.getElementById(id); if(e) e.style.display='none'; });
+
+  const bar = document.createElement('div');
+  bar.style.cssText = 'display:flex;align-items:center;gap:8px;margin-left:auto;'
+    + 'font:12.5px system-ui;color:#8a8f98';
+  bar.innerHTML = '<span>read-only — you can watch, not change</span>'
+    + '<input id="pw" type="password" placeholder="admin password" autocomplete="current-password"'
+    + ' style="width:150px;padding:4px 8px;font-size:12.5px">'
+    + '<button id="li" style="padding:4px 12px;font-size:12.5px;border-radius:6px;'
+    + 'border:1px solid #2a2f38;background:none;color:#8a8f98;cursor:pointer">log in</button>'
+    + '<span id="lm"></span>';
+  (document.querySelector('main > div') || document.body).appendChild(bar);
+
+  const msg = document.getElementById('lm');
+  async function submit(){
+    const v = (document.getElementById('pw').value || '');
+    if(!v){ msg.textContent = 'enter the password'; return; }
+    msg.textContent = 'checking...';
+    try{
+      const r = await fetch('/api/login', {method:'POST',
+        headers:{'Content-Type':'application/json'}, body: JSON.stringify({password:v})});
+      const j = await r.json();
+      if(j && j.operator){ location.reload(); return; }
+      msg.innerHTML = '<span style="color:#ff8a80">' + ((j&&j.error)||'rejected') + '</span>';
+    }catch(e){ msg.textContent = 'login failed'; }
+  }
+  document.getElementById('li').onclick = submit;
+  document.getElementById('pw').addEventListener('keydown', e => {
+    if(e.key === 'Enter') submit();
+  });
 }
 
 applyRole(['stop']);

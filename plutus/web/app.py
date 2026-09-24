@@ -25,6 +25,7 @@ from plutus.analyze import advice as A
 from plutus.analyze import composition as C
 from plutus.analyze import flow as F
 from plutus.analyze import campaign as CP
+from plutus.web import auth
 from plutus.analyze import distribute as D
 from plutus.analyze import holders as H
 from plutus.analyze import ledger as L
@@ -670,28 +671,39 @@ def api_worksheet(token_id: int = 1) -> JSONResponse:
 
 
 # ── who may change things ─────────────────────────────────────────────────────
-# The page has no login, and six of its endpoints are destructive or expensive: delete a token
-# and everything observed about it, stop a running campaign, start one, burn API budget on a
-# full pull. That is fine while the only person who can reach it is the operator on this
-# machine, and stops being fine the moment the port is shared so someone can watch.
+# ONE RULE: reading is open, changing needs the admin password. Reading is open on purpose --
+# the whole point is that someone can watch a campaign. Six endpoints are destructive or
+# expensive (delete a token and everything observed about it, stop a running campaign, start
+# one, spend API budget on a full pull) and all of them sit behind the password.
 #
-# So: the LOOPBACK caller is the operator and nothing changes for them. Anyone else is a viewer
-# and gets a read-only instance -- every GET works, every mutation is refused -- unless they
-# present PLUTUS_KEY, which is how the operator reaches their own desk from another machine.
-OPERATOR_KEY = os.environ.get("PLUTUS_KEY", "").strip()
+# The password is NOT in this repository. It lives in data/admin.json, gitignored, as a scrypt
+# hash. See plutus/web/auth.py.
+#
+# BOOTSTRAP: with no password set, a caller on the machine running the server is let through so
+# a fresh install works immediately. Setting a password ends that for everyone, including the
+# operator. That rule stays true behind a reverse proxy, where every request arrives from
+# 127.0.0.1 and "trust loopback" would otherwise hand operator rights to the entire internet.
 _LOOPBACK = {"127.0.0.1", "::1", "localhost", "::ffff:127.0.0.1"}
+BIND_HOST = os.environ.get("PLUTUS_BIND_HOST", "127.0.0.1").strip()
+TRUST_LOOPBACK = BIND_HOST in _LOOPBACK
+COOKIE = "plutus_session"
+
+# Guessing costs time. scrypt already makes each attempt expensive; this stops a script from
+# running thousands of them in parallel and keeps the log readable.
+_LOGIN_FAILS: dict[str, list[float]] = {}
+_LOGIN_WINDOW_S, _LOGIN_MAX = 300, 8
+
+
+def _client(request: Request) -> str:
+    return (request.client.host if request.client else "") or "?"
 
 
 def _is_operator(request: Request) -> bool:
-    host = (request.client.host if request.client else "") or ""
-    if host in _LOOPBACK:
+    if auth.verify_session(request.cookies.get(COOKIE)):
         return True
-    if OPERATOR_KEY:
-        given = (request.headers.get("X-Plutus-Key")
-                 or request.query_params.get("k") or "").strip()
-        # compare_digest so a wrong key cannot be found one character at a time
-        if given and hmac.compare_digest(given, OPERATOR_KEY):
-            return True
+    # Nobody has set a password yet: allow the machine running the server to get started.
+    if not auth.is_configured() and TRUST_LOOPBACK and _client(request) in _LOOPBACK:
+        return True
     return False
 
 
@@ -699,18 +711,49 @@ def _require_operator(request: Request) -> None:
     if _is_operator(request):
         return
     raise HTTPException(
-        status_code=403,
-        detail="read-only: this view can watch but not change anything. "
-               + ("Add ?k=<your key> to act from another machine."
-                  if OPERATOR_KEY else
-                  "Set PLUTUS_KEY on the server to allow remote control."))
+        status_code=401,
+        detail="admin password required to change anything — this view is read-only")
 
 
 @app.get("/api/whoami")
 def api_whoami(request: Request) -> JSONResponse:
-    """Lets the page hide controls it would only be refused for using."""
+    """Lets the page show a login box instead of buttons that would only be refused."""
     return JSONResponse({"operator": _is_operator(request),
-                         "remote_control": bool(OPERATOR_KEY)})
+                         "configured": auth.is_configured()})
+
+
+@app.post("/api/login")
+def api_login(request: Request, payload: dict = Body(...)) -> JSONResponse:
+    if not auth.is_configured():
+        return JSONResponse(
+            {"error": "no admin password has been set yet — run: "
+                      "python -m plutus.cli setpassword"}, status_code=409)
+    who = _client(request)
+    recent = [t for t in _LOGIN_FAILS.get(who, []) if time.time() - t < _LOGIN_WINDOW_S]
+    _LOGIN_FAILS[who] = recent
+    if len(recent) >= _LOGIN_MAX:
+        wait = int(_LOGIN_WINDOW_S - (time.time() - recent[0]))
+        return JSONResponse({"error": f"too many attempts — wait {wait}s"}, status_code=429)
+
+    if not auth.check_password(str(payload.get("password") or "")):
+        recent.append(time.time())
+        log.warning("failed admin login from %s (%d in the last %ds)",
+                    who, len(recent), _LOGIN_WINDOW_S)
+        return JSONResponse({"error": "wrong password"}, status_code=401)
+
+    _LOGIN_FAILS.pop(who, None)
+    log.info("admin logged in from %s", who)
+    r = JSONResponse({"operator": True})
+    r.set_cookie(COOKIE, auth.mint_session(), max_age=auth.SESSION_DAYS * 86400,
+                 httponly=True, samesite="lax", path="/")
+    return r
+
+
+@app.post("/api/logout")
+def api_logout() -> JSONResponse:
+    r = JSONResponse({"operator": False})
+    r.delete_cookie(COOKIE, path="/")
+    return r
 
 
 # ── background task registry ──────────────────────────────────────────────────
@@ -786,6 +829,9 @@ async def _loop(token_id: int) -> None:
 
 @app.on_event("startup")
 async def _startup() -> None:
+    if not auth.is_configured():
+        log.warning("no admin password set — anyone who can reach this port can change things. "
+                    "Set one with: python -m plutus.cli setpassword")
     for t in db.all_tokens():
         _register(_loops, t["id"], _loop(t["id"]))
         log.info("tracking %s (%s)", t["symbol"] or t["address"][:10], t["chain"])
