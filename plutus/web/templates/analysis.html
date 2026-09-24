@@ -259,8 +259,11 @@ function render(s){
     </table>`
     :'<div class="dim">no census yet</div>')
     +`<div class="note">${C.holders} third-party wallets holding · ${C.exited} fully exited · swept ${ago(C.sweep_ts)}
-      ${C.coverage<0.99?`<br><span class="warn">census reached ${pct(C.coverage,1)} of the float
-      (${num(C.float_true-C.float_seen)} tokens sit below every slice's cutoff)</span>`:''}</div>`
+      ${C.vendor_holders?`<br><b>the census reached ${num(C.holders)} of ${num(C.vendor_holders)}
+        holders</b> — the ranked slices cap at 100 rows each, so the small ones are invisible by
+        COUNT while still being accounted for by VALUE (${pct(C.coverage,1)} of the float)`:''}
+      ${C.coverage<0.99?`<br><span class="warn">${num(C.float_true-C.float_seen)} tokens
+      (${pct(1-C.coverage,1)} of the float) sit below every slice's cutoff</span>`:''}</div>`
     +C.notes.map(n=>`<div class="note w">! ${n}</div>`).join('');
 
   $('venues').innerHTML=`<table><tr><th>pool</th><th>dex</th><th class="num">reserve</th><th class="num">vol24</th></tr>`

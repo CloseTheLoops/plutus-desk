@@ -64,15 +64,41 @@ def acquire(pool: Pool, led: Ledger, target_share: float, budget: float,
         return Advice("acquire", f"Already at {led.ours_share:.2%} of effective supply.",
                       "Nothing to acquire for this target.", numbers={"need": 0})
 
-    if not led.reachable(target_share):
+    ok, route = led.reachable(target_share)
+    if not ok:
         return Advice(
             "acquire",
-            f"UNREACHABLE — {target_share:.1%} needs {need:,.0f} tokens.",
-            f"Only {led.float_:,.0f} tokens exist outside your wallets, the pool and locked "
-            f"contracts. Even buying 100% of the float caps you at {led.ceiling_share:.2%} of "
-            f"effective supply. The engine refuses this target rather than spending toward it.",
-            feasible=False,
-            numbers={"need": need, "float": led.float_, "ceiling": led.ceiling_share})
+            f"IMPOSSIBLE — {target_share:.1%} needs {need:,.0f} tokens.",
+            f"That is more than exists. Only burnt supply is genuinely gone; everything else "
+            f"can be reached at some price.",
+            feasible=False, numbers={"need": need, "float": led.float_})
+
+    if route != "float":
+        # NOT a refusal. The float runs out, but the pool will sell you its inventory and
+        # staked tokens can unstake and become float — both at a cost, neither impossible.
+        extra = target_share * led.effective - led.ours - led.float_
+        pool_frac = min(1.0, extra / led.pool) if led.pool else 1.0
+        pool_cost = pool.cost_to_buy(min(extra, led.pool * 0.99))
+        adv = Advice(
+            "acquire",
+            f"BEYOND THE FLOAT — {target_share:.1%} needs {need:,.0f} tokens, "
+            f"{extra:,.0f} more than the entire float holds.",
+            f"The float alone tops out at {led.float_ceiling:.2%}. Past that the tokens have to "
+            f"come from the pool or from stakers unwinding, and the first of those is priced: "
+            f"taking {pool_frac:.0%} of the pool's inventory costs about "
+            f"${pool_cost:,.0f} and moves spot to roughly "
+            f"{pool.after_buy(pool_cost).spot / spot:.1f}x. Staking "
+            f"({led.locked / led.effective:.2%}) cannot be bought at all — it can only be "
+            f"waited for.",
+            feasible=True,
+            numbers={"need": need, "extra_beyond_float": extra,
+                     "float_ceiling": led.float_ceiling, "pool_cost": pool_cost,
+                     "pool_fraction": pool_frac, "if_unstaked": led.if_unstaked})
+        adv.warnings.append(
+            "Targets above the float ceiling are not refused, but they are a different kind of "
+            "operation: you stop absorbing what is offered and start paying the curve for what "
+            "is not.")
+        return adv
 
     # (A) take it off the pool now
     pool_cost = pool.cost_to_buy(need)

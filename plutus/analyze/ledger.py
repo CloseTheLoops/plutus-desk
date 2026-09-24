@@ -67,12 +67,54 @@ class Ledger:
         return max(0.0, target_share * self.effective - self.ours)
 
     @property
-    def ceiling_share(self) -> float:
-        """The most we could ever hold: everything we have plus the entire float."""
+    def float_ceiling(self) -> float:
+        """The share reachable from the FLOAT ALONE — everything we hold plus every third-party
+        token, bought at something near market.
+
+        THIS IS A COST BOUNDARY, NOT A HARD LIMIT, and an earlier version of this code wrongly
+        treated it as the latter. Two corrections, both from the operator:
+
+        - **The pool is buyable.** Only the LAST token costs infinity; a constant-product curve
+          will sell you half its inventory for roughly its whole quote reserve. Expensive, and
+          it moves the price enormously, but finite and sometimes worth it. See `with_pool`.
+        - **Staking is not destroyed.** Stakers can unstake and sell. Those tokens are
+          temporarily out of the market, not permanently unreachable, and they re-enter as
+          float rather than being bought from the contract. See `if_unstaked`.
+
+        Only BURNT supply is truly gone, which is why burnt is the one class removed from the
+        denominator instead of merely set aside.
+        """
         return self.share(self.ours + self.float_)
 
-    def reachable(self, target_share: float) -> bool:
-        return target_share <= self.ceiling_share + 1e-12
+    def with_pool(self, pool_fraction: float) -> float:
+        """Share reachable if we also buy `pool_fraction` of the pool's inventory."""
+        return self.share(self.ours + self.float_ + self.pool * max(0.0, min(1.0, pool_fraction)))
+
+    @property
+    def if_unstaked(self) -> float:
+        """Share reachable if everything currently staked unstaked and was sold to us."""
+        return self.share(self.ours + self.float_ + self.locked)
+
+    @property
+    def absolute_ceiling(self) -> float:
+        """Everything that is not burnt. The only genuinely permanent limit."""
+        return self.share(self.effective - 0.0) if self.effective else 0.0
+
+    def reachable(self, target_share: float) -> tuple[bool, str]:
+        """Can we get there, and what stands in the way?
+
+        Never a flat no unless the tokens genuinely do not exist. The engine's job is to price
+        the difficulty, not to refuse a target because the cheap route runs out.
+        """
+        if target_share <= self.float_ceiling + 1e-12:
+            return True, "float"
+        if target_share <= self.with_pool(0.9) + 1e-12:
+            return True, "pool"
+        if target_share <= self.if_unstaked + 1e-12:
+            return True, "unstake"
+        if target_share <= 1.0 + 1e-12:
+            return True, "extreme"
+        return False, "impossible"
 
     def rows(self) -> list[dict]:
         out = [
@@ -87,7 +129,8 @@ class Ledger:
              "note": f"{self.pool_venues} venue(s)"},
             {"cls": "locked", "tokens": self.locked, "of_nominal": self.locked / self.nominal
              if self.nominal else 0, "of_effective": self.share(self.locked),
-             "note": "staking / vesting — not float, not ours"},
+             "note": "staking / vesting — out of the market for now, NOT destroyed: "
+                     "it can unstake and become float"},
             {"cls": "float", "tokens": self.float_, "of_nominal": self.float_ / self.nominal
              if self.nominal else 0, "of_effective": self.float_share,
              "note": f"the residual · {self.census_holders} holders seen in the census"},

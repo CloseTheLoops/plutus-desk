@@ -81,7 +81,8 @@ def cmd_ledger(a) -> None:
     print(f"\nreconciles to {total:,.0f} vs nominal {led.nominal:,.0f} "
           f"(diff {total - led.nominal:+,.0f})")
     print(f"ours {led.ours_share:.3%} of effective · float {led.float_share:.3%} · "
-          f"ceiling {led.ceiling_share:.2%}")
+          f"float ceiling {led.float_ceiling:.2%} "
+          f"(+pool@50% -> {led.with_pool(0.5):.2%}, if staking unwinds -> {led.if_unstaked:.2%})")
     for n in led.notes:
         print(f"  ! {n}")
 

@@ -94,6 +94,15 @@ def snapshot(token_id: int) -> dict:
     cal = db.latest_calibration(token_id)
     cap = F.capture_rate(token_id)
 
+    # How many holders the census actually REACHED vs how many exist. The ranked slices cap at
+    # 100 rows each, so small holders are invisible: on the first token we reach ~40% of holders
+    # by COUNT while accounting for 99%+ by SUPPLY. Reporting the count without the denominator
+    # makes the census look complete when it is merely sufficient.
+    holder_count = db.connect().execute(
+        "SELECT holder_count FROM census_meta WHERE token_id=? ORDER BY sweep_ts DESC LIMIT 1",
+        (token_id,)).fetchone()
+    vendor_holders = int(holder_count["holder_count"]) if holder_count and holder_count["holder_count"] else None
+
     venues = db.connect().execute(
         "SELECT * FROM venues WHERE token_id=? ORDER BY reserve_usd DESC", (token_id,)).fetchall()
     pool_row = db.latest_pool(token_id)
@@ -127,7 +136,9 @@ def snapshot(token_id: int) -> dict:
             "ours": led.ours, "pool": led.pool, "locked": led.locked,
             "float": led.float_, "unaccounted": led.unaccounted,
             "ours_share": led.ours_share, "float_share": led.float_share,
-            "ceiling": led.ceiling_share, "rows": led.rows(),
+            "ceiling": led.float_ceiling, "float_ceiling": led.float_ceiling,
+            "with_pool_half": led.with_pool(0.5), "with_pool_90": led.with_pool(0.9),
+            "if_unstaked": led.if_unstaked, "rows": led.rows(),
             "ours_wallets": led.ours_wallets, "ours_holding": led.ours_holding,
             "notes": led.notes, "balance_ts": led.balance_ts,
         },
@@ -152,7 +163,7 @@ def snapshot(token_id: int) -> dict:
             "segments": [vars(s) for s in comp.segments],
             "concentration": comp.concentration, "top": comp.top,
             "coverage": comp.coverage, "float_seen": comp.float_tokens,
-            "float_true": comp.float_true,
+            "float_true": comp.float_true, "vendor_holders": vendor_holders,
             "notes": comp.notes, "sweep_ts": comp.sweep_ts,
         },
         "sell_tokens_per_day": sell_per_day,
