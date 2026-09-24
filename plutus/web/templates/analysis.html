@@ -140,7 +140,10 @@ const FIELDS={
 let SNAP=null;
 
 function syncFields(){
-  const f=FIELDS[$('intent').value];
+  // Fall back rather than throw. syncFields is called from render(), so an unexpected or empty
+  // intent value would abort the WHOLE page draw — not just this control — and the operator
+  // would see a blank screen with nothing in the server log.
+  const f=FIELDS[$('intent').value]||FIELDS.acquire;
   for(let i=0;i<3;i++){
     const lab=$('l'+(i+1)), inp=$('p'+(i+1));
     if(!f[i][0]){lab.textContent='';inp.style.display='none';lab.style.display='none';continue;}
@@ -209,8 +212,10 @@ function render(s){
     <div class="note">Buy/sell are <b>third-party only</b> — our own fills are stripped at ingest.
     "was us" is the share of that window's volume that came from our own wallets; a raw chart would
     add it back in and read the market as more bid than it is.</div>
-    <table><tr><td>sell trend</td><td class="num">${F.sell_trend.toFixed(2)}</td></tr>
-    <tr><td>price rank <span class="dim">0 = at the 24h low</span></td><td class="num">${F.price_rank.toFixed(2)}</td></tr>
+    <table><tr><td>sell trend <span class="dim">vs the prior stretch</span></td><td class="num">${
+      F.sell_trend==null?'<span class="dim">not enough history</span>':F.sell_trend.toFixed(2)+'x'}</td></tr>
+    <tr><td>price rank <span class="dim">0 = at the 24h low</span></td><td class="num">${
+      F.price_rank==null?'—':F.price_rank.toFixed(2)}</td></tr>
     <tr><td>top maker share <span class="dim">alarm at 25%</span></td><td class="num ${
       F.top_maker_share>=.25?'bad':''}">${pct(F.top_maker_share,1)}</td></tr>
     <tr><td>capture rate</td><td class="num">${F.capture==null?'<span class="dim">no supply offered</span>':pct(F.capture,1)}</td></tr>
@@ -267,8 +272,13 @@ function render(s){
 }
 
 async function refresh(){
+  // A throw anywhere inside render() leaves the page blank and silent, because the exception
+  // never reaches the server. Catch it, SAY so, and keep the rest of the page usable.
   try{const r=await fetch('/api/snapshot?token_id={{ token_id }}');render(await r.json());}
-  catch(e){$('sub').innerHTML='<span class="bad">snapshot failed — is the tracker running?</span>';}
+  catch(e){$('sub').innerHTML='<span class="bad">could not draw the page: '
+    +(e&&e.message||e)+'</span> <span class="dim">— the data may be fine; this is a display '
+    +'fault. Check the browser console.</span>';
+    console.error(e);}
 }
 
 $('ask').onclick=async()=>{
