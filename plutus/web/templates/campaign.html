@@ -50,6 +50,19 @@
   .note{font-size:12px;color:var(--dim);margin-top:8px}
   .note.w{color:var(--warn)}
   code{background:#0a0d12;padding:1px 5px;border-radius:4px;font-size:11.5px}
+  .copy{cursor:pointer;border-bottom:1px dotted var(--line)}
+  .copy:hover{color:var(--acc);border-bottom-color:var(--acc)}
+  .split{display:flex;height:26px;border-radius:5px;overflow:hidden;margin:8px 0 6px;font-size:10.5px}
+  .split div{flex:0 0 auto;display:flex;align-items:center;justify-content:center;
+    color:#0e1116;font-weight:700;min-width:0;overflow:hidden;white-space:nowrap}
+  .legend{display:flex;gap:14px;flex-wrap:wrap;font-size:11px;color:var(--dim)}
+  .legend span::before{content:"■ "}
+  .ours{color:var(--ours)}
+  tr.us td{box-shadow:inset 3px 0 0 var(--ours)}
+  .fin{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px}
+  .fin div{background:#0a0d12;border:1px solid var(--line);border-radius:8px;padding:11px 13px}
+  .fin b{display:block;font-size:19px;font-variant-numeric:tabular-nums}
+  .fin span{font-size:10.5px;color:var(--dim);text-transform:uppercase;letter-spacing:.04em}
 </style>
 </head>
 <body>
@@ -84,6 +97,25 @@
   <h3>live market</h3>
   <table id="mkt"></table>
   <div class="note" id="notes"></div>
+</div>
+
+<div class="card">
+  <h3><span class="live"></span>who is trading — us vs everyone else</h3>
+  <div class="split" id="split"></div>
+  <div class="legend" id="splitLg"></div>
+  <table id="tot"></table>
+  <div class="note" id="splitNote"></div>
+</div>
+
+<div class="card">
+  <h3>active wallets since this campaign started</h3>
+  <table id="acts"></table>
+  <div class="note" id="actsNote"></div>
+</div>
+
+<div class="card" id="finalCard" style="display:none">
+  <h3>final stats</h3>
+  <div id="final"></div>
 </div>
 
 <script>
@@ -156,6 +188,98 @@ function render(d){
     ${n.peak_price?`<tr><td>peak price this run</td><td class="num">${n.peak_price.toExponential(4)}</td></tr>`:''}`;
   $('notes').innerHTML=(d.notes||[]).map(x=>`<div class="note w">! ${x}</div>`).join('');
   $('stop').style.display=d.state==='running'?'':'none';
+  renderSplit(d);
+}
+
+function copyAddr(el){
+  const a=el.dataset.full||el.textContent.trim();
+  const done=()=>{const t=el.textContent;el.textContent='copied ✓';
+    setTimeout(()=>{el.textContent=t;},900);};
+  if(navigator.clipboard&&window.isSecureContext){navigator.clipboard.writeText(a).then(done,fb);}
+  else fb();
+  function fb(){const ta=document.createElement('textarea');ta.value=a;
+    ta.style.cssText='position:fixed;opacity:0';document.body.appendChild(ta);ta.select();
+    try{document.execCommand('copy');done();}catch(e){}document.body.removeChild(ta);}
+}
+document.addEventListener('click',e=>{const el=e.target.closest('.copy');if(el)copyAddr(el);});
+
+// A campaign is a contest over who is on which side of the move. The number that decides
+// whether a push was worth running is not how far the chart went but how much of the volume was
+// OUR OWN money — a move carried entirely by us unwinds the moment we stop.
+function renderSplit(d){
+  const P=d.participants||{}, o=P.ours||{}, t=P.third||{}, tot=P.total_volume||0;
+  const fin=$('finalCard');
+  if(!tot){
+    $('split').innerHTML=''; $('splitLg').innerHTML='';
+    $('tot').innerHTML='<tr><td class="dim">no trades yet since this campaign started</td></tr>';
+    $('splitNote').textContent='';
+    $('acts').innerHTML='<tr><td class="dim">nothing yet</td></tr>';
+    $('actsNote').textContent='';
+  } else {
+    const ow=100*(o.volume||0)/tot, tw=100-ow;
+    $('split').innerHTML=
+      (ow>0?`<div style="flex-basis:${ow}%;background:#7a5cd6" title="us: ${usd(o.volume)}">${
+        ow>14?'us '+ow.toFixed(0)+'%':(ow>5?ow.toFixed(0)+'%':'')}</div>`:'')
+     +(tw>0?`<div style="flex-basis:${tw}%;background:#4cc38a" title="everyone else: ${usd(t.volume)}">${
+        tw>14?'everyone else '+tw.toFixed(0)+'%':(tw>5?tw.toFixed(0)+'%':'')}</div>`:'');
+    $('splitLg').innerHTML=`<span class="ours">us ${usd(o.volume)}</span>`
+      +`<span class="good">everyone else ${usd(t.volume)}</span>`
+      +`<span class="dim">${usd(tot)} total across ${P.active} wallets</span>`;
+    $('tot').innerHTML=`
+      <tr><th></th><th class="num">wallets</th><th class="num">fills</th>
+          <th class="num">bought</th><th class="num">sold</th><th class="num">net</th></tr>
+      <tr class="us"><td class="ours">us</td><td class="num">${o.wallets||0}</td>
+        <td class="num">${o.fills||0}</td><td class="num">${usd(o.buy_usd)}</td>
+        <td class="num">${usd(o.sell_usd)}</td>
+        <td class="num ${o.net>0?'good':(o.net<0?'bad':'dim')}">${(o.net>0?'+':'')+usd(o.net)}</td></tr>
+      <tr><td class="good">everyone else</td><td class="num">${t.wallets||0}</td>
+        <td class="num">${t.fills||0}</td><td class="num">${usd(t.buy_usd)}</td>
+        <td class="num">${usd(t.sell_usd)}</td>
+        <td class="num ${t.net>0?'good':(t.net<0?'bad':'dim')}">${(t.net>0?'+':'')+usd(t.net)}</td></tr>`;
+    const share=P.our_share_of_volume||0;
+    $('splitNote').innerHTML = share>0.6
+      ? `<span class="warn">! ${pct(share)} of this campaign's volume is your own money. A move
+         carried mostly by you is not being paid for by anyone else, and it gives back what you
+         put in when you stop.</span>`
+      : `Your share of campaign volume is ${pct(share)}. The lower that stays while the goal
+         still advances, the more of the move someone else is funding.`;
+    const ws=P.wallets||[];
+    $('acts').innerHTML=`<tr><th>wallet</th><th class="num">fills</th><th class="num">bought</th>
+        <th class="num">sold</th><th class="num">net</th><th class="num">last seen</th></tr>`
+     +ws.map(w=>`<tr class="${w.is_ours?'us':''}">
+        <td>${w.is_ours?'<span class="ours">us · </span>':''}<code class="copy"
+          data-full="${w.maker}" title="click to copy">${(w.maker||'').slice(0,10)}…${
+          (w.maker||'').slice(-6)}</code></td>
+        <td class="num">${w.fills}</td><td class="num">${usd(w.buy_usd)}</td>
+        <td class="num">${usd(w.sell_usd)}</td>
+        <td class="num ${w.net>0?'good':(w.net<0?'bad':'dim')}">${(w.net>0?'+':'')+usd(w.net)}</td>
+        <td class="num dim">${mins(Math.floor(Date.now()/1000)-w.last_ts)} ago</td></tr>`).join('');
+    $('actsNote').innerHTML=`${P.active} wallet${P.active===1?'':'s'} traded since this campaign
+      started. Purple edge means ours. Click any address to copy it.`;
+  }
+  const over = d.state!=='running' || (d.step&&(d.step.action==='DONE'||d.step.action==='STOP'));
+  fin.style.display = over ? '' : 'none';
+  if(over) renderFinal(d);
+}
+
+function renderFinal(d){
+  const P=d.participants||{},o=P.ours||{},t=P.third||{},b=d.baseline||{},n=d.now||{};
+  const moved=(b.spot&&n.spot)?n.spot/b.spot:null;
+  const netUsd=(o.sell_usd||0)-(o.buy_usd||0);
+  const netTok=(o.buy_tok||0)-(o.sell_tok||0);
+  const share=P.our_share_of_volume||0;
+  $('final').innerHTML=`<div class="fin">
+    <div><b class="${moved>1?'good':(moved<1?'bad':'')}">${moved?moved.toFixed(2)+'x':'—'}</b><span>price moved</span></div>
+    <div><b>${usd(o.buy_usd)}</b><span>we spent</span></div>
+    <div><b>${usd(o.sell_usd)}</b><span>we received</span></div>
+    <div><b class="${netUsd>=0?'good':'bad'}">${(netUsd>=0?'+':'')+usd(netUsd)}</b><span>our net cash</span></div>
+    <div><b class="${netTok>=0?'good':'bad'}">${(netTok>=0?'+':'')+num(netTok)}</b><span>our net tokens</span></div>
+    <div><b>${usd(t.volume)}</b><span>everyone else traded</span></div>
+    <div><b class="${share>0.6?'warn':'good'}">${pct(share)}</b><span>volume that was us</span></div>
+    <div><b>${P.active||0}</b><span>wallets involved</span></div>
+  </div><div class="note">${share>0.6
+    ? '<span class="warn">Most of this move was your own money — a rally with nobody else in it, which reverts when you stop.</span>'
+    : 'Outside participation carried '+pct(1-share)+' of the volume. That share is what makes a move durable.'}</div>`;
 }
 
 async function load(){

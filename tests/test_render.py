@@ -79,6 +79,10 @@ function __el(){ return {
   selectedIndex:0, disabled:false, step:1,
   addEventListener(){}, removeEventListener(){}, add(){}, appendChild(){}, click(){},
   querySelectorAll(){return []}, closest(){return null}, remove(){},
+  // querySelector must return another element, not null: the pages reach into a container and
+  // set properties on what comes back (progress fill, time marker), so a null here would throw
+  // inside the STUB rather than surfacing a real fault in the page.
+  querySelector(){ return __el(); },
 }; }
 global.document = {
   getElementById(id){ return __els[id] || (__els[id]=__el()); },
@@ -97,10 +101,24 @@ global.Option = function(t,v){ return {text:t, value:v}; };
 """
 
 
+CAMPAIGN = {
+    "id": 1, "kind": "push", "state": "running", "started_ts": 0, "deadline_ts": None,
+    "elapsed_s": 0, "remaining_s": None, "time_pct": None, "progress_pct": 0.0,
+    "params": {}, "baseline": {}, "now": {}, "token_id": 1,
+    "done": {"bought_usd": 0, "bought_tok": 0, "sold_usd": 0, "sold_tok": 0,
+             "fills": 0, "avg_buy": None, "avg_sell": None},
+    "step": {"action": "HOLD", "usd": 0, "tokens": 0, "reason": "", "urgency": "normal"},
+    "notes": [],
+    "participants": {"wallets": [], "ours": {}, "third": {}, "total_volume": 0,
+                     "our_share_of_volume": 0.0, "active": 0},
+}
+
+
 def _render_tpl(name: str) -> str:
     env = Environment(loader=FileSystemLoader(TPL_DIR))
-    ctx = dict(token_id=1, tokens=[{"id": 1, "symbol": "T", "chain": "robinhood",
-                                    "address": "0x" + "a" * 40}],
+    ctx = dict(token_id=1, cid=1, kind="push",
+               tokens=[{"id": 1, "symbol": "T", "chain": "robinhood",
+                        "address": "0x" + "a" * 40}],
                chains=sorted(config.CHAINS.values(), key=lambda c: (not c.verified, c.name)))
     return env.get_template(name).render(**ctx)
 
@@ -129,6 +147,17 @@ def test_analysis_renders_with_nulls_everywhere():
 
 def test_holders_renders_with_nulls_everywhere():
     _run("holders.html", HOLDERS, "DATA=" + json.dumps(HOLDERS) + "; render();")
+
+
+def test_campaign_renders_with_nulls_everywhere():
+    _run("campaign.html", CAMPAIGN, "render(" + json.dumps(CAMPAIGN) + ");")
+
+
+def test_campaign_renders_when_finished_with_no_trades():
+    """The final-stats block divides by volume that may be zero."""
+    c = json.loads(json.dumps(CAMPAIGN))
+    c["state"] = "stopped"
+    _run("campaign.html", c, "render(" + json.dumps(c) + ");")
 
 
 def test_analysis_survives_a_sell_trend_of_null():

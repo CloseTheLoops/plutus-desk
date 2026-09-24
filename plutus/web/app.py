@@ -350,8 +350,28 @@ def api_advice(token_id: int = 1, intent: str = Query("acquire"),
                         sell_tokens_per_day=snap["sell_tokens_per_day"],
                         capture=0.6, accurate_to=accurate_to)
     elif intent == "push":
+        # Above the model's envelope, ask the venue instead of extrapolating a curve that is
+        # known to drift optimistic with size.
+        real = None
+        est = pool.cost_to_push(max(1.0, p1 / pool.fdv(led.nominal))) if p1 else 0.0
+        if est > accurate_to:
+            tok = db.token_row(token_id)
+            ours = sorted(a for a, c in db.class_map(token_id).items() if c == "ours")
+            if tok["quote_token"] and ours:
+                try:
+                    from plutus.sources import gmgn as _g
+                    q = _g.quote(tok["chain"], ours[0], tok["quote_token"], tok["address"],
+                                 int(est * 1e6), slippage=50)
+                    real = float(q.get("output_amount") or q.get("amount_out") or 0) / 1e18 or None
+                except Exception:  # noqa: BLE001 — fall back to the model, flagged
+                    log.warning("live quote for push failed; using the model")
         adv = A.push(pool, led.nominal, p1, int(p2 or 60),
-                     max_impact=(p3 or 4) / 100.0, accurate_to=accurate_to)
+                     max_impact=(p3 or 4) / 100.0, accurate_to=accurate_to,
+                     real_tokens=real, float_tokens=led.float_)
+        if real:
+            adv.warnings.append(
+                "Token count came from a LIVE QUOTE, not the curve model — at this size the "
+                "model runs about 2% optimistic.")
     elif intent == "distribute":
         # p1 = participation % · p2 = sell at most, % of holdings · p3 = floor price (0 = none)
         led2 = L.build(token_id)

@@ -67,6 +67,7 @@ class Status:
     progress_pct: float          # how far to the goal
     params: dict = field(default_factory=dict)
     baseline: dict = field(default_factory=dict)
+    participants: dict = field(default_factory=dict)
     now: dict = field(default_factory=dict)
     done: dict = field(default_factory=dict)     # what WE have actually done
     step: Step = field(default_factory=lambda: Step("HOLD"))
@@ -126,6 +127,55 @@ def _our_fills(token_id: int, since: int) -> dict:
     return d
 
 
+def participants(token_id: int, since: int) -> dict:
+    """Every wallet that traded during the campaign, and the us-versus-them split.
+
+    A campaign is not just a price path, it is a contest over who is on which side of it. The
+    number that decides whether a push was worth running is not how far the chart moved but how
+    much of the volume was OUR OWN money — a move carried entirely by us is a move that unwinds
+    the moment we stop, and that is invisible unless the split is kept.
+    """
+    rows = db.connect().execute(
+        """SELECT maker, is_ours,
+                  COALESCE(SUM(CASE WHEN side='buy'  THEN usd END),0) buy_usd,
+                  COALESCE(SUM(CASE WHEN side='sell' THEN usd END),0) sell_usd,
+                  COALESCE(SUM(CASE WHEN side='buy'  THEN tokens END),0) buy_tok,
+                  COALESCE(SUM(CASE WHEN side='sell' THEN tokens END),0) sell_tok,
+                  COUNT(*) fills, MAX(ts) last_ts
+           FROM trades WHERE token_id=? AND ts>=? AND maker<>''
+           GROUP BY maker, is_ours ORDER BY (buy_usd+sell_usd) DESC""",
+        (token_id, since)).fetchall()
+    wallets = []
+    for r in rows:
+        d = dict(r)
+        d["volume"] = d["buy_usd"] + d["sell_usd"]
+        d["net"] = d["buy_usd"] - d["sell_usd"]
+        wallets.append(d)
+
+    def tot(pred):
+        sel = [w for w in wallets if pred(w)]
+        return {
+            "wallets": len(sel),
+            "fills": sum(w["fills"] for w in sel),
+            "buy_usd": sum(w["buy_usd"] for w in sel),
+            "sell_usd": sum(w["sell_usd"] for w in sel),
+            "buy_tok": sum(w["buy_tok"] for w in sel),
+            "sell_tok": sum(w["sell_tok"] for w in sel),
+            "volume": sum(w["volume"] for w in sel),
+            "net": sum(w["net"] for w in sel),
+        }
+
+    ours, third = tot(lambda w: w["is_ours"]), tot(lambda w: not w["is_ours"])
+    total_vol = ours["volume"] + third["volume"]
+    return {
+        "wallets": wallets[:60],
+        "ours": ours, "third": third,
+        "total_volume": total_vol,
+        "our_share_of_volume": (ours["volume"] / total_vol) if total_vol else 0.0,
+        "active": len(wallets),
+    }
+
+
 def status(cid: int, pool: Pool, led: L.Ledger) -> Status | None:
     c = get(cid)
     if not c:
@@ -140,12 +190,18 @@ def status(cid: int, pool: Pool, led: L.Ledger) -> Status | None:
 
     done = _our_fills(c["token_id"], c["started_ts"])
     fl = F.measure(c["token_id"], 900)
+    parts = participants(c["token_id"], c["started_ts"])
     st = Status(id=cid, kind=c["kind"], state=c["state"], started_ts=c["started_ts"],
                 deadline_ts=c["deadline_ts"], elapsed_s=elapsed, remaining_s=remaining,
                 time_pct=time_pct, progress_pct=0.0, params=p, baseline=b, done=done,
                 now={"spot": pool.spot, "fdv": pool.fdv(led.nominal), "Q": pool.Q,
                      "ours": led.ours, "ours_share": led.ours_share,
                      "third_net_15m": fl.third_net, "regime": F.regime(fl)[0]})
+    st.participants = parts
+
+    # The final read on a push: what fraction of the move did we pay for ourselves?
+    if b.get("spot") and pool.spot:
+        st.now["price_move_x"] = pool.spot / b["spot"]
 
     if c["kind"] == "push":
         _push(st, p, b, pool, led, fl)

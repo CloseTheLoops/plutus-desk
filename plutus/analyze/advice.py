@@ -158,7 +158,12 @@ def acquire(pool: Pool, led: Ledger, target_share: float, budget: float,
 
 # ── MODE B · push FDV to a level in a window ──────────────────────────────────
 def push(pool: Pool, supply_nominal: float, target_fdv: float, minutes: int,
-         max_impact: float = 0.04, accurate_to: float = math.inf) -> Advice:
+         max_impact: float = 0.04, accurate_to: float = math.inf,
+         real_tokens: float | None = None, float_tokens: float = 0.0) -> Advice:
+    """`real_tokens` is what a LIVE QUOTE says the spend actually buys. Above the model's
+    calibrated envelope the caller is expected to supply it, because the curve drifts optimistic
+    with size — measured at 0.4% out at $1k and 2.1% out at $13k, always in the direction of
+    promising more tokens than arrive."""
     fdv0 = pool.fdv(supply_nominal)
     if target_fdv <= fdv0:
         return Advice("push", f"Already at ${fdv0:,.0f} FDV.",
@@ -170,13 +175,19 @@ def push(pool: Pool, supply_nominal: float, target_fdv: float, minutes: int,
     slices = max(1, round(minutes / 10))
     per_slice = cost / slices
 
+    if real_tokens:
+        tokens = real_tokens          # a live quote beats the model, always
+    avg_x = (cost / tokens) / pool.spot if tokens else 0.0
+    absorb_cost = tokens * pool.spot * (1 + pool.fee)
+
     adv = Advice(
         "push",
-        f"A {m:.2f}x move costs ${cost:,.0f} and hands you {tokens:,.0f} tokens.",
-        f"That is {tokens/supply_nominal:.2%} of supply at {(cost/tokens)/pool.spot:.3f}x spot. "
-        f"**This is acquisition, not spend** — you were going to buy those tokens anyway; doing "
-        f"it in {minutes} minutes instead of over days is what makes the chart move, and it is "
-        f"graded on the same efficiency metric as any other buy.",
+        f"A {m:.2f}x move costs ${cost:,.0f} and buys {tokens:,.0f} tokens "
+        f"({tokens/supply_nominal:.2%} of supply) at **{avg_x:.2f}x spot**.",
+        f"It is acquisition — but not cheap acquisition. The same {tokens:,.0f} tokens absorbed "
+        f"from sellers near spot would cost about **${absorb_cost:,.0f}**, so the push pays "
+        f"**{cost/absorb_cost:.1f}x** for the same supply. The extra ${cost-absorb_cost:,.0f} is "
+        f"what the chart move costs you.",
         numbers={"multiple": m, "cost": cost, "tokens": tokens, "fdv_from": fdv0,
                  "fdv_to": target_fdv, "slices": slices, "per_slice": per_slice,
                  "avg_price_x": (cost / tokens) / pool.spot if tokens else None})
@@ -191,6 +202,19 @@ def push(pool: Pool, supply_nominal: float, target_fdv: float, minutes: int,
         adv.warnings.append(
             f"Each slice moves price {slice_impact:.1%}, over your {max_impact:.0%} cap. "
             f"Lengthen the window or raise the cap.")
+    if float_tokens:
+        # Durability. The move is only worth what it is if it survives contact with the float.
+        after = pool.after_buy(cost)
+        for frac in (0.05, 0.10):
+            q = after.after_sell(float_tokens * frac)
+            if q.spot * supply_nominal < target_fdv * 0.75:
+                adv.warnings.append(
+                    f"FRAGILE: {frac:.0%} of the float ({float_tokens*frac:,.0f} tokens) selling "
+                    f"into this takes FDV back to ${q.spot*supply_nominal:,.0f}, and the "
+                    f"{tokens:,.0f} tokens you just bought for ${cost:,.0f} would be worth "
+                    f"${tokens*q.spot:,.0f}. A push only holds if the supply above you stays put.")
+                break
+
     if per_slice > accurate_to:
         adv.needs_quote = True
         adv.warnings.append(
