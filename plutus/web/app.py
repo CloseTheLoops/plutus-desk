@@ -691,18 +691,48 @@ COOKIE = "plutus_session"
 # Guessing costs time. scrypt already makes each attempt expensive; this stops a script from
 # running thousands of them in parallel and keeps the log readable.
 _LOGIN_FAILS: dict[str, list[float]] = {}
-_LOGIN_WINDOW_S, _LOGIN_MAX = 300, 8
+_LOGIN_ALL: list[float] = []
+_LOGIN_WINDOW_S, _LOGIN_MAX, _LOGIN_MAX_ALL = 300, 8, 40
+
+
+def _via_proxy(request: Request) -> bool:
+    """Did this request pass through a reverse proxy?
+
+    A proxied deployment normally binds the app to 127.0.0.1 so that ONLY the proxy can reach
+    it -- which is also exactly the configuration that makes "the caller is on loopback" look
+    true for every visitor on the internet. The bind address cannot distinguish the two cases;
+    the presence of a forwarding header can.
+    """
+    return any(h in request.headers
+               for h in ("x-forwarded-for", "x-real-ip", "forwarded", "x-forwarded-host"))
+
+
+def _peer(request: Request) -> str:
+    """The socket we are actually talking to. Unspoofable, and the proxy behind a proxy."""
+    return (request.client.host if request.client else "") or "?"
 
 
 def _client(request: Request) -> str:
-    return (request.client.host if request.client else "") or "?"
+    """Best guess at the end client, for rate-limit bucketing only.
+
+    X-Forwarded-For is attacker-controlled, so this is never used for a trust decision -- only
+    to keep one visitor's failures from filling another's bucket. The global cap below is what
+    actually bounds guessing, precisely because this value can be forged.
+    """
+    xff = request.headers.get("x-forwarded-for") or ""
+    if xff:
+        return xff.split(",")[0].strip() or _peer(request)
+    return request.headers.get("x-real-ip") or _peer(request)
 
 
 def _is_operator(request: Request) -> bool:
     if auth.verify_session(request.cookies.get(COOKIE)):
         return True
-    # Nobody has set a password yet: allow the machine running the server to get started.
-    if not auth.is_configured() and TRUST_LOOPBACK and _client(request) in _LOOPBACK:
+    # Nobody has set a password yet: let the machine running the server get started. Never
+    # through a proxy -- there, loopback is the proxy, not the operator, and this would hand
+    # the bootstrap to whoever asked first.
+    if (not auth.is_configured() and TRUST_LOOPBACK
+            and _peer(request) in _LOOPBACK and not _via_proxy(request)):
         return True
     return False
 
@@ -729,14 +759,21 @@ def api_login(request: Request, payload: dict = Body(...)) -> JSONResponse:
             {"error": "no admin password has been set yet — run: "
                       "python -m plutus.cli setpassword"}, status_code=409)
     who = _client(request)
-    recent = [t for t in _LOGIN_FAILS.get(who, []) if time.time() - t < _LOGIN_WINDOW_S]
+    now = time.time()
+    recent = [t for t in _LOGIN_FAILS.get(who, []) if now - t < _LOGIN_WINDOW_S]
     _LOGIN_FAILS[who] = recent
-    if len(recent) >= _LOGIN_MAX:
-        wait = int(_LOGIN_WINDOW_S - (time.time() - recent[0]))
+    _LOGIN_ALL[:] = [t for t in _LOGIN_ALL if now - t < _LOGIN_WINDOW_S]
+    # Per-client keeps one visitor from filling another's bucket. The GLOBAL cap is what
+    # actually bounds guessing, because the per-client key comes from a header an attacker
+    # controls and can rotate at will.
+    if len(recent) >= _LOGIN_MAX or len(_LOGIN_ALL) >= _LOGIN_MAX_ALL:
+        oldest = recent[0] if len(recent) >= _LOGIN_MAX else _LOGIN_ALL[0]
+        wait = int(_LOGIN_WINDOW_S - (now - oldest))
         return JSONResponse({"error": f"too many attempts — wait {wait}s"}, status_code=429)
 
     if not auth.check_password(str(payload.get("password") or "")):
-        recent.append(time.time())
+        recent.append(now)
+        _LOGIN_ALL.append(now)
         log.warning("failed admin login from %s (%d in the last %ds)",
                     who, len(recent), _LOGIN_WINDOW_S)
         return JSONResponse({"error": "wrong password"}, status_code=401)
@@ -744,8 +781,13 @@ def api_login(request: Request, payload: dict = Body(...)) -> JSONResponse:
     _LOGIN_FAILS.pop(who, None)
     log.info("admin logged in from %s", who)
     r = JSONResponse({"operator": True})
+    # `secure` when the page was served over HTTPS, including when TLS terminated at a proxy
+    # and only the forwarded header says so. Without it the session cookie is sent in clear on
+    # any accidental http:// request to the same host.
+    https = (request.url.scheme == "https"
+             or request.headers.get("x-forwarded-proto", "").split(",")[0].strip() == "https")
     r.set_cookie(COOKIE, auth.mint_session(), max_age=auth.SESSION_DAYS * 86400,
-                 httponly=True, samesite="lax", path="/")
+                 httponly=True, samesite="lax", path="/", secure=https)
     return r
 
 

@@ -25,10 +25,10 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 class _Req:
     """The little of starlette.Request the guard actually reads."""
 
-    def __init__(self, host="127.0.0.1", session=None):
+    def __init__(self, host="127.0.0.1", session=None, headers=None):
         self.client = type("C", (), {"host": host})()
         self.cookies = {app.COOKIE: session} if session else {}
-        self.headers = {}
+        self.headers = headers or {}
         self.query_params = {}
 
 
@@ -160,6 +160,45 @@ def test_no_password_is_committed_anywhere_in_the_repo():
                 bad.append(f"{rel}:{body[:m.start()].count(chr(10)) + 1}")
     assert not bad, f"a hardcoded credential appears in tracked files: {sorted(set(bad))}"
 
+
+
+def test_bootstrap_is_refused_through_a_reverse_proxy():
+    """THE deployment trap. A proxied app binds to 127.0.0.1 so only the proxy can reach it --
+    which is also exactly what makes every visitor look like they are on loopback. With no
+    password set, the first stranger to load the page would otherwise be handed the desk."""
+    prev, prev_trust = auth.PATH, app.TRUST_LOOPBACK
+    auth.PATH = ROOT / "data" / "admin_absent.json"
+    app.TRUST_LOOPBACK = True                      # bound to 127.0.0.1, as a proxied app is
+    try:
+        assert not auth.is_configured()
+        assert app._is_operator(_Req("127.0.0.1")), "direct local bootstrap should still work"
+        for hdr in ("x-forwarded-for", "x-real-ip", "forwarded", "x-forwarded-host"):
+            r = _Req("127.0.0.1", headers={hdr: "203.0.113.9"})
+            assert not app._is_operator(r), (
+                f"a request carrying {hdr} was bootstrap-trusted — behind a proxy that hands "
+                f"the unconfigured desk to whoever loads it first")
+    finally:
+        auth.PATH, app.TRUST_LOOPBACK = prev, prev_trust
+
+
+def test_rate_limit_cannot_be_evaded_by_rotating_the_forwarded_header():
+    """X-Forwarded-For is attacker-controlled, so a purely per-client cap is no cap at all."""
+    src = inspect.getsource(app.api_login)
+    assert "_LOGIN_ALL" in src,         "there is no global login cap, so rotating X-Forwarded-For gives unlimited attempts"
+    assert app._LOGIN_MAX_ALL > app._LOGIN_MAX,         "the global cap must be looser than the per-client one or normal use trips it"
+
+
+def test_forwarded_headers_never_grant_trust():
+    """They may bucket a rate limit; they must never decide who the operator is."""
+    src = inspect.getsource(app._is_operator)
+    assert "_client(" not in src,         "_is_operator uses the spoofable forwarded address; it must use _peer()"
+    assert "_peer(" in src
+
+
+def test_session_cookie_is_secure_behind_tls():
+    src = inspect.getsource(app.api_login)
+    assert "secure=" in src and "x-forwarded-proto" in src,         "the session cookie is not marked secure when TLS terminated at a proxy"
+    assert "httponly=True" in src, "the session cookie must not be readable from JavaScript"
 
 if __name__ == "__main__":
     fails = 0

@@ -120,3 +120,48 @@ process, reading intents this one writes, holding the keys and its own caps — 
 the web layer yields a read-only dashboard and nothing more.
 
 MIT licensed.
+
+## Deploying behind a reverse proxy
+
+The admin password guards every state-changing endpoint. Reading stays open, so anyone with the
+URL can watch a campaign but cannot delete a token, stop a run or spend API budget.
+
+**The password is per-deployment.** It lives in `data/admin.json` as a scrypt hash and is
+gitignored, so it is never copied by `git pull`. Set one on the server before the port is
+reachable:
+
+```bash
+python -m plutus.cli setpassword          # prompts, or reads PLUTUS_ADMIN_PASSWORD
+```
+
+Until a password is set, the server lets a caller **on the machine itself** through so a fresh
+install is usable. That bootstrap is refused for any request carrying a forwarding header
+(`X-Forwarded-For`, `X-Real-IP`, `Forwarded`, `X-Forwarded-Host`), because a proxied app is
+normally bound to `127.0.0.1` — which is also exactly what makes every visitor look local. Set
+the password first and the question never arises: once one exists, loopback earns nothing.
+
+Run the app on loopback and let the proxy reach it:
+
+```bash
+python -m plutus.cli serve --host 127.0.0.1 --port 8800
+```
+
+Pass the client address through, or every visitor shares one rate-limit bucket:
+
+```nginx
+proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+proxy_set_header X-Forwarded-Proto $scheme;
+proxy_set_header Host              $host;
+```
+
+`X-Forwarded-Proto` matters: it is how the app knows to mark the session cookie `secure`. The
+forwarded address is used **only** to bucket the login rate limit, never to decide who the
+operator is — it is attacker-controlled, so a global cap bounds guessing regardless of how many
+addresses an attacker claims.
+
+If you run uvicorn directly rather than through `plutus.cli serve`, set `PLUTUS_BIND_HOST`
+yourself so the app knows what it bound to, and pass `--proxy-headers`.
+
+**Rate limits are shared per API key, not per process.** The pacer's clock lives in the database,
+so the service and any CLI command coordinate automatically — but only if they use the same
+`data/` directory. Two checkouts with separate databases are two independent budgets.
