@@ -111,6 +111,9 @@ CAMPAIGN = {
     "notes": [],
     "participants": {"wallets": [], "ours": {}, "third": {}, "total_volume": 0,
                      "our_share_of_volume": 0.0, "active": 0},
+    # The freshness block. as_of/age_s are null before the first pool observation, which is
+    # exactly when a campaign page is most likely to be opened.
+    "data": {"as_of": None, "age_s": None, "refreshed": False, "stale": True, "error": None},
 }
 
 
@@ -151,6 +154,14 @@ def test_holders_renders_with_nulls_everywhere():
 
 def test_campaign_renders_with_nulls_everywhere():
     _run("campaign.html", CAMPAIGN, "render(" + json.dumps(CAMPAIGN) + ");")
+
+
+def test_campaign_renders_with_a_stale_data_block():
+    """The freshness banner divides and rounds age_s, which is legitimately null."""
+    c = json.loads(json.dumps(CAMPAIGN))
+    c["data"] = {"as_of": None, "age_s": None, "refreshed": False, "stale": True,
+                 "error": None}
+    _run("campaign.html", c, "render(" + json.dumps(c) + ");")
 
 
 def test_campaign_renders_when_finished_with_no_trades():

@@ -94,7 +94,7 @@
 </div>
 
 <div class="card">
-  <h3>live market</h3>
+  <h3>live market <span id="age" class="dim" style="font-weight:400;font-size:12px"></span></h3>
   <table id="mkt"></table>
   <div class="note" id="notes"></div>
 </div>
@@ -285,7 +285,20 @@ function renderFinal(d){
 async function load(){
   try{
     const r=await fetch('/api/campaign/{{ cid }}');
-    render(await r.json());
+    const j=await r.json();
+    render(j);
+    // State the age of the data the step was computed from. A monitor that redraws on a timer
+    // while the numbers underneath it are minutes old is worse than one that is visibly slow.
+    const d=j&&j.data, a=$('age');
+    if(a){
+      if(!d) a.textContent='';
+      else if(d.error) a.innerHTML='<span class="bad">refresh failed: '+d.error+'</span>';
+      else if(d.stale) a.innerHTML='<span class="bad">· data '+
+        (d.age_s==null?'of unknown age':Math.round(d.age_s)+'s old')+
+        ' — this step was NOT computed on current prices</span>';
+      else a.textContent='· '+(d.age_s==null?'':Math.round(d.age_s)+'s old')+
+        (d.refreshed?' (refreshed now)':'');
+    }
     $('tick').textContent='updated '+new Date().toLocaleTimeString();
   }catch(e){ $('tick').innerHTML='<span class="bad">update failed</span>'; }
 }
@@ -293,7 +306,7 @@ $('stop').onclick=async()=>{
   await fetch('/api/campaign/{{ cid }}/stop',{method:'POST'});
   load();
 };
-load(); setInterval(load,20000);
+load(); setInterval(load,10000);
 </script>
 </main>
 </body>

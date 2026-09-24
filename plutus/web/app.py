@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 import math
 import time
 from pathlib import Path
@@ -456,6 +457,32 @@ def api_holders(token_id: int = 1, target: float = 0.0) -> JSONResponse:
     }, default=_safe)))
 
 
+# How old reserves/tape may be before a campaign poll refreshes them inline. Below the page's
+# own poll interval, so a running campaign is always looking at data from this poll or the last.
+STALE_AFTER_S = 12
+_refresh_locks: dict[int, threading.Lock] = {}
+_refresh_lock_guard = threading.Lock()
+
+
+def _refresh_if_stale(token_id: int) -> bool:
+    """Pull reserves and tape if they are older than STALE_AFTER_S. Returns whether it did.
+
+    Locked per token: several browser tabs polling the same campaign would otherwise each start
+    their own pull, and the writes would interleave. The second caller through the lock re-checks
+    the age and finds it fresh, so it costs nothing.
+    """
+    with _refresh_lock_guard:
+        lk = _refresh_locks.setdefault(token_id, threading.Lock())
+    with lk:
+        row = db.latest_pool(token_id)
+        age = (db.now() - row["ts"]) if row and row["ts"] else None
+        if age is not None and age <= STALE_AFTER_S:
+            return False
+        T.track_pool(token_id)
+        T.track_tape(token_id)
+        return True
+
+
 @app.post("/api/refresh")
 async def api_refresh(token_id: int = 1, full: bool = False) -> JSONResponse:
     """Pull fresh data now.
@@ -541,16 +568,46 @@ async def api_campaign_create(payload: dict = Body(...)) -> JSONResponse:
 
 @app.get("/api/campaign/{cid}")
 def api_campaign_status(cid: int) -> JSONResponse:
+    """A running campaign's state, computed on data refreshed for THIS call.
+
+    WHY THIS REFRESHES RATHER THAN READING THE DATABASE. A campaign step is a live instruction --
+    buy this much now, stop selling, the move is over. It is computed from pool reserves and
+    third-party flow. Serving it from whatever the last manual pull happened to leave in the
+    database produces a page that updates on a timer while the numbers underneath it are
+    minutes old: confidently stale, which is worse than visibly slow, because nothing on screen
+    says so.
+
+    Reserves and tape cost two calls and about a second, so they are refreshed inline. The
+    response carries `as_of` and `stale` regardless, so the page can state the age of what it is
+    showing rather than implying it is current.
+    """
     c = CP.get(cid)
     if not c:
         return JSONResponse({"error": "no such campaign"}, status_code=404)
-    pool = _pool(c["token_id"])
+    tid = c["token_id"]
+
+    refreshed, refresh_error = False, None
+    if c.get("state") == "running":
+        try:
+            refreshed = _refresh_if_stale(tid)
+        except Exception as exc:                  # noqa: BLE001 — never wedge the monitor
+            refresh_error = str(exc)[:160]
+            log.warning("campaign %s: inline refresh failed: %s", cid, exc)
+
+    pool = _pool(tid)
     if pool is None:
         return JSONResponse({"error": "no pool observation yet"}, status_code=409)
-    st = CP.status(cid, pool, L.build(c["token_id"]))
+    st = CP.status(cid, pool, L.build(tid))
     d = vars(st)
     d["step"] = vars(st.step)
-    d["token_id"] = c["token_id"]
+    d["token_id"] = tid
+
+    row = db.latest_pool(tid)
+    as_of = row["ts"] if row and row["ts"] else None
+    age = (db.now() - as_of) if as_of else None
+    d["data"] = {"as_of": as_of, "age_s": age, "refreshed": refreshed,
+                 "stale": age is None or age > STALE_AFTER_S * 3,
+                 "error": refresh_error}
     return JSONResponse(json.loads(json.dumps(d, default=_safe)))
 
 

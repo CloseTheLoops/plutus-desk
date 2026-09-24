@@ -23,7 +23,10 @@ import re
 import subprocess
 import threading
 import time
+import uuid
 from typing import Any
+
+import requests
 
 from plutus import config
 
@@ -81,6 +84,120 @@ def _env() -> dict[str, str] | None:
     return e
 
 
+# ── direct HTTP transport ─────────────────────────────────────────────────────
+# WHY THIS EXISTS. Every read below is "exist auth" in the vendor's own client: an API key in a
+# header plus a timestamp and a client_id in the query. No signature, no private key. Going
+# straight to the endpoint removes a Node process spawn per call -- measured at 0.57s via the
+# CLI against 0.30s over HTTP on an idle machine, and far worse than that on a loaded one, where
+# CLI startup was clocked at 2-3s while bare node stayed at 0.4s.
+#
+# IT ALSO TIGHTENS THE TRUST BOUNDARY RATHER THAN LOOSENING IT. This path never reads
+# GMGN_PRIVATE_KEY, so it is structurally incapable of signing a swap -- the analysis layer's
+# rule stops being a blocklist it must remember to check and becomes a capability it does not
+# have. Anything requiring a signature has no route here and falls through to the CLI, where
+# _FORBIDDEN still refuses it.
+#
+# Every route is parity-tested against the CLI in tests/test_http_parity.py. A faster transport
+# that returns a different shape is worse than a slow one, because the difference shows up as
+# wrong numbers rather than as an error.
+HOST = "https://openapi.gmgn.ai"
+USE_HTTP = os.environ.get("PLUTUS_NO_HTTP", "").strip() not in ("1", "true", "yes")
+
+# (command, subcommand) -> (method, path, {cli_flag: query_param})
+_ROUTES: dict[tuple, tuple] = {
+    ("token", "info"): ("GET", "/v1/token/info", {"--chain": "chain", "--address": "address"}),
+    ("token", "pool"): ("GET", "/v1/token/pool_info", {"--chain": "chain", "--address": "address"}),
+    ("token", "security"): ("GET", "/v1/token/security",
+                            {"--chain": "chain", "--address": "address"}),
+    ("token", "traders"): ("GET", "/v1/market/token_top_traders",
+                           {"--chain": "chain", "--address": "address", "--limit": "limit",
+                            "--order-by": "order_by", "--tag": "tag"}),
+    ("portfolio", "token-balance"): ("GET", "/v1/user/wallet_token_balance",
+                                     {"--chain": "chain", "--wallet": "wallet_address",
+                                      "--token": "token_address"}),
+    ("portfolio", "info"): ("GET", "/v1/user/info", {}),
+    ("order", "quote"): ("GET", "/v1/trade/quote",
+                         {"--chain": "chain", "--from": "from_address",
+                          "--input-token": "input_token", "--output-token": "output_token",
+                          "--amount": "input_amount", "--slippage": "slippage"}),
+    ("gas-price",): ("GET", "/v1/trade/gas_price", {"--chain": "chain"}),
+}
+
+_session = None
+_session_lock = threading.Lock()
+
+
+def _api_key() -> str | None:
+    """The API key for the profile in use. Deliberately does NOT read GMGN_PRIVATE_KEY."""
+    path = os.path.join(ANALYTICS_HOME, ".config", "gmgn", ".env")
+    if not os.path.isfile(path):
+        path = os.path.join(os.path.expanduser("~"), ".config", "gmgn", ".env")
+    try:
+        for ln in open(path, encoding="utf-8"):
+            ln = ln.strip()
+            if ln.startswith("GMGN_API_KEY="):
+                return ln.split("=", 1)[1].strip().strip('"').strip("'") or None
+    except OSError:
+        return None
+    return os.environ.get("GMGN_API_KEY") or None
+
+
+def _get_session():
+    global _session
+    with _session_lock:
+        if _session is None:
+            s = requests.Session()
+            # One pooled connection per worker, so TLS is negotiated once rather than per call.
+            ad = requests.adapters.HTTPAdapter(pool_connections=4, pool_maxsize=16, max_retries=0)
+            s.mount("https://", ad)
+            _session = s
+        return _session
+
+
+def _http_call(args: tuple[str, ...]) -> Any:
+    """Serve one call over HTTP, or raise _NoRoute so the caller falls back to the CLI."""
+    route = _ROUTES.get(tuple(args[:2])) or _ROUTES.get(tuple(args[:1]))
+    if route is None:
+        raise _NoRoute
+    key = _api_key()
+    if not key:
+        raise _NoRoute
+    method, path, flagmap = route
+    rest = [a for a in args if a != "--raw"]
+    rest = rest[2:] if tuple(args[:2]) in _ROUTES else rest[1:]
+    params: dict[str, Any] = {}
+    i = 0
+    while i < len(rest):
+        flag = rest[i]
+        if flag not in flagmap:                 # an argument this route does not model
+            raise _NoRoute
+        params[flagmap[flag]] = rest[i + 1]
+        i += 2
+    params["timestamp"] = int(time.time())
+    params["client_id"] = str(uuid.uuid4())
+
+    _pace()
+    r = _get_session().request(
+        method, HOST + path, params=params, timeout=TIMEOUT,
+        headers={"X-APIKEY": key, "Content-Type": "application/json",
+                 "User-Agent": "gmgn-cli/1.5.6"})
+    if r.status_code == 429:
+        raise GmgnError(f"RATE_LIMIT {path}: {r.text[:160]}")
+    if r.status_code != 200:
+        raise GmgnError(f"http {r.status_code} {path}: {r.text[:160]}")
+    body = r.json()
+    # The CLI hands callers the payload, not the envelope. Match it exactly.
+    if isinstance(body, dict) and "code" in body and "data" in body:
+        if body.get("code") not in (0, None):
+            raise GmgnError(f"api code {body.get('code')} {path}: {str(body)[:160]}")
+        return body["data"]
+    return body
+
+
+class _NoRoute(Exception):
+    """This call has no HTTP route; use the CLI."""
+
+
 def _pace() -> None:
     """Hold the global minimum interval between calls, across threads.
 
@@ -115,6 +232,14 @@ def call(*args: str, attempts: int = 3) -> Any:
         if tuple(args[:n]) in _FORBIDDEN:
             raise GmgnError(f"{' '.join(args[:n])!r} requires a private key — "
                             "the analysis layer must never call it")
+
+    if USE_HTTP:
+        try:
+            return _http_call(args)
+        except _NoRoute:
+            pass                                   # no route — fall through to the CLI
+        except GmgnError:
+            log.warning("http path failed for %s, falling back to the CLI", " ".join(args[:3]))
 
     cmd = [*CLI, *args, "--raw"]
     for attempt in range(1, attempts + 1):
