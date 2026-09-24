@@ -124,6 +124,120 @@ def cmd_serve(a) -> None:
     uvicorn.run("plutus.web.app:app", host=a.host, port=a.port, log_level="info")
 
 
+def cmd_doctor(a) -> None:
+    """Walk the balance chain in dependency order and name the first broken link.
+
+    WHY THIS EXISTS. "Wallets show no balance" has at least six causes that look identical on the
+    page: the wrong gmgn profile, an incomplete .env, a valid key with no entitlement, a token
+    that was never onboarded, wallets that were never classified as ours, and a sweep that was
+    never run. Guessing between them from a screenshot costs more than checking them in order.
+
+    The last check is the one that matters: it calls the vendor directly for one of our wallets
+    and compares the answer to what the database holds. That separates "the API returns zero"
+    from "we never asked".
+    """
+    import os
+
+    from plutus.sources import gmgn
+
+    def line(ok, label, detail=""):
+        print(f"  {'PASS' if ok else 'FAIL'}  {label}" + (f"  —  {detail}" if detail else ""))
+        return ok
+
+    print()
+    print("gmgn credentials")
+    home = gmgn.ANALYTICS_HOME
+    env_path = os.path.join(home, ".config", "gmgn", ".env")
+    if not os.path.isfile(env_path):
+        line(True, "profile", f"no .env at {home} — inheriting the CLI's default profile")
+    else:
+        try:
+            gmgn._env()
+            body = open(env_path, encoding="utf-8").read()
+            kid = ""
+            for ln in body.splitlines():
+                if ln.startswith("GMGN_API_KEY="):
+                    kid = ln.split("=", 1)[1].strip()[:13] + "…"
+            line(True, "profile", f"{home} · key {kid}")
+        except gmgn.GmgnError as exc:
+            line(False, "profile", str(exc)[:160])
+            return
+
+    try:
+        gmgn.call("gas-price", "--chain", a.chain, attempts=1)
+        line(True, "api key accepted", "unsigned call succeeded (gas-price)")
+    except Exception as exc:                                       # noqa: BLE001
+        line(False, "api key accepted", str(exc)[:160])
+        return
+    try:
+        bound = gmgn.bound_wallets()
+        line(True, "private key signs", f"portfolio info returned {len(bound)} bound wallet(s)")
+        if not bound:
+            print("        note: no wallets are BOUND to this key. token-balance does not "
+                  "require binding, so this is only a problem if you meant to use it as the "
+                  "authoritative source for the OURS set.")
+    except Exception as exc:                                       # noqa: BLE001
+        line(False, "private key signs", str(exc)[:160])
+        return
+
+    if not a.token:
+        print()
+        print("(pass a token name for the per-token checks)")
+        print()
+        return
+
+    print()
+    print(f"token '{a.token}'")
+    try:
+        tid, cfg = _token_id(a.token)
+    except SystemExit:
+        return
+    line(True, "onboarded", f"id={tid} chain={cfg.chain}")
+
+    classes: dict[str, int] = {}
+    for r in db.classified(tid):
+        classes[r["class"]] = classes.get(r["class"], 0) + 1
+    ours = classes.get("ours", 0)
+    line(bool(classes), "addresses classified", str(classes) if classes else
+         "NOTHING classified — paste your wallet list on /add, or run: "
+         f"python -m plutus.cli worksheet {a.token}")
+    if not ours:
+        line(False, "wallets marked 'ours'",
+             "zero. The ledger has nothing to sum, so it reports that we hold nothing. "
+             "This is the most common cause of an empty desk.")
+        return
+
+    bal = db.latest_balances(tid)
+    seen = [x for x in db.classified(tid, "ours") if x["address"] in bal]
+    line(bool(bal), "balance observations",
+         f"{len(bal)} rows · {len(seen)} of {ours} of our wallets have one"
+         if bal else "NONE. Run a full pull: python -m plutus.cli tick "
+                     f"{a.token} --full")
+
+    print()
+    print("live probe (vendor vs database, one wallet)")
+    w = db.classified(tid, "ours")[0]["address"]
+    stored = bal.get(w, (None, None))[0]
+    try:
+        live, height = gmgn.token_balance(cfg.chain, w, cfg.address)
+    except Exception as exc:                                       # noqa: BLE001
+        line(False, "vendor call", f"{w[:12]}… -> {str(exc)[:120]}")
+        return
+    line(True, "vendor call", f"{w[:12]}… -> {live:,.4f} tokens (height {height})")
+    if live > 0 and not stored:
+        line(False, "database agrees",
+             "the vendor reports a balance the database does not have. The sweep never "
+             f"stored it — run: python -m plutus.cli tick {a.token} --full  and read the "
+             "tick's detail line for failed reads.")
+    elif live == 0:
+        line(False, "database agrees",
+             "the vendor itself reports zero for this wallet. Check the token address and "
+             "chain in your token config, and that this wallet is on that chain.")
+    else:
+        line(True, "database agrees", f"stored {stored:,.4f}")
+    print()
+
+
 def main() -> None:
     p = argparse.ArgumentParser(prog="plutus", description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -141,6 +255,10 @@ def main() -> None:
 
     w = sub.add_parser("worksheet"); w.add_argument("token")
     w.add_argument("--min-share", type=float, default=0.002); w.set_defaults(fn=cmd_worksheet)
+
+    d = sub.add_parser("doctor", help="why are the balances zero?")
+    d.add_argument("token", nargs="?"); d.add_argument("--chain", default="robinhood")
+    d.set_defaults(fn=cmd_doctor)
 
     s = sub.add_parser("serve"); s.add_argument("--host", default="127.0.0.1")
     s.add_argument("--port", type=int, default=8800); s.set_defaults(fn=cmd_serve)

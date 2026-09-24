@@ -48,26 +48,32 @@ class GmgnError(RuntimeError):
 def _env() -> dict[str, str] | None:
     """Point gmgn-cli at the analytics profile, or inherit if there isn't one.
 
-    THE BROKEN STATE THIS REFUSES TO RUN IN. gmgn-cli signs every request with
-    `keypair.pem`; the `.env` only identifies which API key is signing. A profile holding one
-    without the other authenticates as nobody. Every call then fails, `trackers` logs a warning
-    per wallet, the balance simply never gets recorded, and `ledger` defaults what it cannot find
-    to 0.0 -- so the desk reports wallets holding nothing and looks like a data problem.
+    WHAT THE CREDENTIAL ACTUALLY IS. Both halves live in the profile's `.env`: `GMGN_API_KEY`
+    identifies, `GMGN_PRIVATE_KEY` signs. `keypair.pem` is a leftover artifact of `gmgn-cli
+    config` generating the pair -- the CLI does not read it, and a profile without one is
+    perfectly healthy. (Verified: a profile holding only `.env` authenticates signed endpoints.)
 
-    Half a profile is strictly worse than no profile, because no profile falls back to a working
-    default. So this raises instead of returning a config that cannot sign.
+    Half a credential is still worse than none, because none falls back to a working default
+    while a partial one silently fails every call -- balances then read 0.0 and it looks like a
+    data problem. So this checks for the two fields that matter, and nothing else.
     """
     cfg = os.path.join(ANALYTICS_HOME, ".config", "gmgn")
-    key_file, pem = os.path.join(cfg, ".env"), os.path.join(cfg, "keypair.pem")
+    key_file = os.path.join(cfg, ".env")
     if not os.path.isfile(key_file):
         return None                      # inherit; the default key is whatever the CLI finds
-    if not os.path.isfile(pem):
+    try:
+        body = open(key_file, encoding="utf-8").read()
+    except OSError as exc:
+        raise GmgnError(f"cannot read {key_file}: {exc}") from None
+    missing = [f for f in ("GMGN_API_KEY", "GMGN_PRIVATE_KEY") if f"{f}=" not in body]
+    if missing:
         raise GmgnError(
-            f"{ANALYTICS_HOME} has an API key but no keypair.pem, so nothing can be signed and "
-            f"every balance would silently read zero. Generate one FOR THIS PROFILE'S OWN KEY "
-            f"({'HOME' if os.name != 'nt' else 'USERPROFILE'}={ANALYTICS_HOME} gmgn-cli config) "
-            f"-- do not copy another profile's keypair, it belongs to a different API key. "
-            f"Or set PLUTUS_GMGN_HOME to a complete profile.")
+            f"{key_file} is missing {' and '.join(missing)}, so calls cannot be "
+            f"{'identified' if 'GMGN_API_KEY' in missing else 'signed'} and every balance would "
+            f"silently read zero. Re-apply the key for THIS profile "
+            f"({'HOME' if os.name != 'nt' else 'USERPROFILE'}={ANALYTICS_HOME} "
+            f"gmgn-cli config --apply <api_key>), or point PLUTUS_GMGN_HOME at a complete "
+            f"profile.")
     e = os.environ.copy()
     e["USERPROFILE" if os.name == "nt" else "HOME"] = ANALYTICS_HOME
     return e
