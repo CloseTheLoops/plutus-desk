@@ -236,6 +236,50 @@ def record_trades(rows: list[tuple]) -> int:
     return conn.total_changes - before
 
 
+# Every table keyed by token_id. Listed once, as data, and CHECKED against the live schema on
+# each delete -- a table added later and not listed here would quietly survive a wipe the
+# operator believes finished, which is the worst possible outcome for a delete button.
+TOKEN_KEYED = ("venues", "addresses", "calibration", "pool_obs", "trades", "balances",
+               "census", "census_meta", "ticks", "campaigns")
+
+
+def delete_token(token_id: int) -> dict:
+    """Erase one token and every observation of it. Irreversible.
+
+    Returns the row count removed PER TABLE. A delete that reports success without saying what
+    it removed is how an operator ends up believing data is gone when it is not -- so this
+    reports, and it also names any token-keyed table it did not know about.
+    """
+    c = connect()
+    live = {r["name"] for r in
+            c.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+    removed: dict[str, int] = {}
+    for t in TOKEN_KEYED:
+        if t in live:
+            removed[t] = c.execute(f"DELETE FROM {t} WHERE token_id=?", (token_id,)).rowcount
+    removed["tokens"] = c.execute("DELETE FROM tokens WHERE id=?", (token_id,)).rowcount
+    c.commit()
+
+    # Any OTHER table carrying a token_id column that nobody listed above.
+    unlisted = []
+    for t in live - set(TOKEN_KEYED) - {"tokens", "sqlite_sequence"}:
+        cols = {r["name"] for r in c.execute(f"PRAGMA table_info({t})").fetchall()}
+        if "token_id" in cols:
+            unlisted.append(t)
+
+    # Reclaim the pages. Without this the deleted rows stay readable in the file, which for a
+    # button whose whole purpose is "this data is gone" would be a lie.
+    vacuumed = True
+    try:
+        c.execute("VACUUM")
+    except Exception as exc:                                     # noqa: BLE001
+        vacuumed = False
+        log.warning("VACUUM after delete failed: %s", exc)
+
+    return {"removed": removed, "rows": sum(removed.values()),
+            "vacuumed": vacuumed, "unlisted_tables": unlisted}
+
+
 def record_balances(token_id: int, rows: list[tuple[str, float, int | None]]) -> None:
     ts = now()
     connect().executemany(

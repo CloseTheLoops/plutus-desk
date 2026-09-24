@@ -46,9 +46,28 @@ class GmgnError(RuntimeError):
 
 
 def _env() -> dict[str, str] | None:
-    key_file = os.path.join(ANALYTICS_HOME, ".config", "gmgn", ".env")
+    """Point gmgn-cli at the analytics profile, or inherit if there isn't one.
+
+    THE BROKEN STATE THIS REFUSES TO RUN IN. gmgn-cli signs every request with
+    `keypair.pem`; the `.env` only identifies which API key is signing. A profile holding one
+    without the other authenticates as nobody. Every call then fails, `trackers` logs a warning
+    per wallet, the balance simply never gets recorded, and `ledger` defaults what it cannot find
+    to 0.0 -- so the desk reports wallets holding nothing and looks like a data problem.
+
+    Half a profile is strictly worse than no profile, because no profile falls back to a working
+    default. So this raises instead of returning a config that cannot sign.
+    """
+    cfg = os.path.join(ANALYTICS_HOME, ".config", "gmgn")
+    key_file, pem = os.path.join(cfg, ".env"), os.path.join(cfg, "keypair.pem")
     if not os.path.isfile(key_file):
         return None                      # inherit; the default key is whatever the CLI finds
+    if not os.path.isfile(pem):
+        raise GmgnError(
+            f"{ANALYTICS_HOME} has an API key but no keypair.pem, so nothing can be signed and "
+            f"every balance would silently read zero. Generate one FOR THIS PROFILE'S OWN KEY "
+            f"({'HOME' if os.name != 'nt' else 'USERPROFILE'}={ANALYTICS_HOME} gmgn-cli config) "
+            f"-- do not copy another profile's keypair, it belongs to a different API key. "
+            f"Or set PLUTUS_GMGN_HOME to a complete profile.")
     e = os.environ.copy()
     e["USERPROFILE" if os.name == "nt" else "HOME"] = ANALYTICS_HOME
     return e

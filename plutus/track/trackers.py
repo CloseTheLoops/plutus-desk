@@ -113,19 +113,26 @@ def track_inventory(token_id: int, full: bool = False, window_s: int = 3600) -> 
 
     skipped = [w for w in targets if not config.is_address(chain, w)]
     targets = [w for w in targets if config.is_address(chain, w)]
-    rows, calls = [], 0
+    rows, calls, failed = [], 0, []
     for w in targets:
         try:
             bal, height = gmgn.token_balance(chain, w, address)
             calls += 1
             rows.append((w, bal, height))
         except gmgn.GmgnError as exc:
+            # A wallet we could not read is NOT a wallet holding nothing. It never reaches
+            # record_balances, so ledger falls back to 0.0 and the operator sees an empty desk.
+            # Count them and fail the tick, or the UI reports a clean sweep over missing data.
+            failed.append(w)
             log.warning("balance failed for %s: %s", w[:10], exc)
     db.record_balances(token_id, rows)
-    return TickResult("inventory", True, calls, time.time() - t0,
+    ok = not failed
+    return TickResult("inventory", ok, calls, time.time() - t0,
                       f"{'FULL' if full else 'delta'} · {len(rows)} of "
                       f"{len(ours)+len(others)} addresses ({calls} calls, {time.time()-t0:.1f}s)"
-                      + (f" · skipped {len(skipped)} non-address ids" if skipped else ""))
+                      + (f" · skipped {len(skipped)} non-address ids" if skipped else "")
+                      + (f" · {len(failed)} BALANCE READS FAILED — those wallets are unread, "
+                         f"not empty" if failed else ""))
 
 
 # ── census ────────────────────────────────────────────────────────────────────

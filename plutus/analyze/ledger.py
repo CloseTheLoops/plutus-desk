@@ -179,7 +179,16 @@ def build(token_id: int) -> Ledger:
 
     missing = [a for a in by_class.get("ours", []) if a not in balances]
     if missing:
-        notes.append(f"{len(missing)} of our wallets have no balance observation yet")
+        total_ours = len(by_class.get("ours", []))
+        if missing and len(missing) == total_ours:
+            notes.append(
+                f"NO BALANCE WAS READ FOR ANY OF OUR {total_ours} WALLETS. Every figure below "
+                f"that depends on what we hold is wrong, not zero. This is almost always the "
+                f"gmgn profile failing to sign (an API key with no keypair.pem) — check the "
+                f"inventory tick's detail line before reading anything on this page.")
+        else:
+            notes.append(f"{len(missing)} of our {total_ours} wallets have no balance "
+                         f"observation yet — our position is UNDERSTATED by whatever they hold")
 
     census_ts = db.latest_census_ts(token_id)
     holders = 0

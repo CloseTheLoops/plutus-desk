@@ -96,10 +96,28 @@
 <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
   <h1 id="title">Plutus</h1>
   <select id="tokpick" style="width:auto;padding:5px 9px;font-size:12.5px">
-    {% for t in tokens %}<option value="{{ t.id }}" {% if t.id == token_id %}selected{% endif %}>{{ t.symbol or t.address[:10] }} · {{ t.chain }}</option>{% endfor %}
+    {% for t in tokens %}<option value="{{ t.id }}" data-confirm="{{ t.symbol or t.address }}" {% if t.id == token_id %}selected{% endif %}>{{ t.symbol or t.address[:10] }} · {{ t.chain }}</option>{% endfor %}
   </select>
   <a href="/add" style="color:var(--acc);font-size:12.5px;text-decoration:none;
      border:1px solid var(--line);border-radius:6px;padding:5px 11px">+ add token</a>
+  {% if tokens %}<button id="delBtn" onclick="askDelete()" title="erase this token and every
+     observation of it — cannot be undone" style="font-size:12.5px;padding:5px 11px;
+     border:1px solid var(--line);border-radius:6px;background:none;color:var(--dim);
+     cursor:pointer">delete</button>{% endif %}
+  <div id="delBar" style="display:none;width:100%;align-items:center;gap:10px;flex-wrap:wrap;
+       border:1px solid #6b2220;background:#2a1211;border-radius:8px;padding:10px 12px;
+       font-size:12.5px;margin-top:4px">
+    <span>Erase <b id="delWord"></b> and <b>every observation of it</b> — balances, trades,
+      census, calibration, campaigns. This cannot be undone. Type the name to confirm:</span>
+    <input id="delIn" spellcheck="false" autocomplete="off"
+           style="width:150px;padding:4px 8px;font-size:12.5px">
+    <button onclick="doDelete()" style="padding:4px 12px;font-size:12.5px;border-radius:6px;
+            border:1px solid #6b2220;background:#4a1a18;color:#ffb4ae;cursor:pointer">erase</button>
+    <button onclick="document.getElementById('delBar').style.display='none'"
+            style="padding:4px 12px;font-size:12.5px;border-radius:6px;border:1px solid var(--line);
+            background:none;color:var(--dim);cursor:pointer">cancel</button>
+    <span id="delSt" class="dim"></span>
+  </div>
   <div class="pull" style="margin-left:auto">
     <button id="pullQ" onclick="pull(false)" title="pool reserves + trade tape · ~2s">↻ pull</button>
     <button id="pullF" onclick="pull(true)" title="also every wallet balance + the holder census · ~2min">↻↻ full pull</button>
@@ -395,6 +413,35 @@ function copyAddr(el){
 document.addEventListener('click',e=>{
   const el=e.target.closest('.copy'); if(el) copyAddr(el);
 });
+
+// ── delete this token ────────────────────────────────────────────────────────
+// Typed confirmation, not a one-click fire and not a native confirm() — a modal blocks the page
+// and an unguarded button eventually erases the token the operator was only looking at.
+function askDelete(){
+  const sel=document.getElementById('tokpick');
+  const opt=sel&&sel.selectedOptions&&sel.selectedOptions[0];
+  const word=(opt&&opt.dataset&&opt.dataset.confirm)||'';
+  const bar=document.getElementById('delBar');
+  document.getElementById('delWord').textContent=word;
+  document.getElementById('delIn').value='';
+  document.getElementById('delSt').textContent='';
+  bar.style.display='flex';
+  document.getElementById('delIn').focus();
+}
+async function doDelete(){
+  const st=document.getElementById('delSt');
+  const v=(document.getElementById('delIn').value||'').trim();
+  if(!v){ st.textContent='type the name first'; return; }
+  st.textContent='erasing…';
+  try{
+    const r=await fetch(`/api/token/{{ token_id }}?confirm=${encodeURIComponent(v)}`,
+                        {method:'DELETE'});
+    const j=await r.json();
+    if(j&&j.error){ st.textContent=j.error; return; }
+    st.textContent=`removed ${j.rows} rows`;
+    location.href='/';
+  }catch(e){ st.textContent='delete failed: '+e; }
+}
 
 // ── pull fresh data on demand ────────────────────────────────────────────────
 async function pull(full){

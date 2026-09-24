@@ -405,6 +405,26 @@ def api_advice(token_id: int = 1, intent: str = Query("acquire"),
     }, default=_safe)))
 
 
+@app.delete("/api/token/{token_id}")
+def api_delete_token(token_id: int, confirm: str = "") -> JSONResponse:
+    """Erase one token and everything observed about it. Cannot be undone.
+
+    `confirm` must match the token's own symbol or address. A delete button that fires on a
+    single click eventually deletes the token the operator was only looking at.
+    """
+    t = db.token_row(token_id)
+    if t is None:
+        return JSONResponse({"error": f"unknown token {token_id}"}, status_code=404)
+    want = {(t["symbol"] or "").strip().lower(), (t["address"] or "").strip().lower()} - {""}
+    if confirm.strip().lower() not in want:
+        return JSONResponse(
+            {"error": f"confirm did not match — type {t['symbol'] or t['address']!r} exactly"},
+            status_code=400)
+    res = db.delete_token(token_id)
+    log.warning("DELETED token %s (%s) — %d rows", token_id, t["symbol"], res["rows"])
+    return JSONResponse({"deleted": token_id, "symbol": t["symbol"], **res})
+
+
 @app.get("/holders", response_class=HTMLResponse)
 def holders_page(token_id: int = 1) -> HTMLResponse:
     toks = db.all_tokens()
