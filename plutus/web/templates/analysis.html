@@ -52,7 +52,17 @@
   select,input[type=number]{background:#0a0d12;color:var(--ink);border:1px solid var(--line);
     border-radius:6px;padding:7px 9px;font-size:13px;font-family:inherit;width:100%}
   label.f{display:block;font-size:10.5px;color:var(--dim);text-transform:uppercase;letter-spacing:.05em;margin-bottom:4px}
-  .ctl{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:11px;margin-bottom:12px}
+  /* Each field contributes its label, input and help to SHARED rows via display:contents, so the
+     three line up across every column. Stacking each field in its own cell meant a two-line
+     label pushed its input down while a one-line label did not, and the row went ragged. */
+  .ctl{display:grid;grid-template-columns:repeat(4,minmax(165px,1fr));
+       grid-template-rows:auto auto auto;grid-auto-flow:column;
+       column-gap:14px;row-gap:5px;margin-bottom:14px;align-items:start}
+  @media(max-width:900px){.ctl{grid-template-columns:repeat(2,minmax(165px,1fr))}}
+  @media(max-width:560px){.ctl{grid-template-columns:1fr;grid-auto-flow:row}}
+  .ctl > .fld{display:contents}
+  .ctl > .fld.off{display:none}
+  label.f{align-self:end}
   button{background:var(--acc);color:#fff;border:0;border-radius:7px;padding:9px 20px;font-size:13.5px;cursor:pointer;font-family:inherit}
   .adv{background:#0a0d12;border-left:3px solid var(--acc);border-radius:0 8px 8px 0;padding:12px 15px;margin:10px 0}
   .adv.bad{border-left-color:var(--bad)}
@@ -118,16 +128,17 @@
 <div class="card key">
 <h3>what do you want?</h3>
 <div class="ctl">
-  <div><label class="f">intent</label><select id="intent">
+  <div class="fld"><label class="f">intent</label><select id="intent">
     <option value="acquire">Acquire — get me to a supply share</option>
     <option value="push">Push — take FDV to a level, in a window</option>
     <option value="distribute">Distribute — sell into a catalyst as it happens</option>
-  </select></div>
-  <div><label class="f" id="l1"></label><input type="number" id="p1">
+  </select>
+  <div class="help">Pick what you are trying to do. The fields beside change to match.</div></div>
+  <div class="fld" id="f1"><label class="f" id="l1"></label><input type="number" id="p1">
     <div class="help" id="h1"></div></div>
-  <div><label class="f" id="l2"></label><input type="number" id="p2">
+  <div class="fld" id="f2"><label class="f" id="l2"></label><input type="number" id="p2">
     <div class="help" id="h2"></div></div>
-  <div><label class="f" id="l3"></label><input type="number" id="p3">
+  <div class="fld" id="f3"><label class="f" id="l3"></label><input type="number" id="p3">
     <div class="help" id="h3"></div></div>
 </div>
 <button id="ask">Show me what this costs</button>
@@ -151,26 +162,26 @@ const ago=t=>{if(!t)return'never';const s=Math.floor(Date.now()/1000)-t;
 // "expected outside buying" — asked for the single number nobody can know in advance.
 const FIELDS={
  acquire:[
-  ['How much of the tradeable supply do you want to end up holding?',60,1,
+  ['What share of tradeable supply do you want to end up with? (%)',60,1,
    'You hold <b id="curShare">—</b> now. This is the finishing line, not the amount to buy.'],
-  ['How much are you willing to spend getting there?',25000,1000,
+  ['Most you will spend getting there ($)',25000,1000,
    'A hard cap. If the target costs more than this, it says so rather than starting.'],
   ['',null,null,'']],
  push:[
-  ['Where do you want the price to get to? (FDV in $)',0,1000,
+  ['Where should the price get to? ($ FDV)',0,1000,
    'Now: <b id="curFdv">—</b>. FDV is price × total supply, so this is just the price in a bigger unit.'],
   ['Over how long? (minutes)',60,5,
    'The buying is split across this window instead of hitting at once. Longer is cheaper and less obvious.'],
-  ['How much may any single buy move the price? (%)',4,1,
+  ['Most any single buy may move price (%)',4,1,
    'The program is cut into slices. This caps how violent each one is — a big slice pays more '
    +'for its own impact and prints a candle anyone can see.']],
  distribute:[
-  ['What share of incoming buying will you take? (%)',35,5,
+  ['Share of incoming buying you take (%)',35,5,
    '<b>The whole dial.</b> Take 25% and the rally keeps running while you sell; take 100% and '
    +'you cancel the buying entirely and kill the move with inventory still unsold.'],
-  ['Sell at most how much of your holdings? (%)',10,1,
+  ['Most of your holdings you will sell (%)',10,1,
    'A hard cap so a run-away catalyst cannot distribute more than you meant.'],
-  ['Never sell below this price (0 = no floor)',0,0.00001,
+  ['Never sell below this price (0 = none)',0,0.00001,
    'A price, not a percentage. Below it, the desk stops selling regardless of demand.']]
 };
 let SNAP=null;
@@ -181,9 +192,9 @@ function syncFields(){
   // would see a blank screen with nothing in the server log.
   const f=FIELDS[$('intent').value]||FIELDS.acquire;
   for(let i=0;i<3;i++){
-    const lab=$('l'+(i+1)), inp=$('p'+(i+1));
-    if(!f[i][0]){lab.textContent='';inp.style.display='none';lab.style.display='none';continue;}
-    lab.style.display='';inp.style.display='';
+    const lab=$('l'+(i+1)), inp=$('p'+(i+1)), fld=$('f'+(i+1));
+    if(!f[i][0]){ fld.classList.add('off'); continue; }
+    fld.classList.remove('off');
     lab.innerHTML=f[i][0]; inp.step=f[i][2];
     const h=$('h'+(i+1)); if(h) h.innerHTML=f[i][3]||'';
     if(inp.dataset.intent!==$('intent').value){
@@ -191,7 +202,17 @@ function syncFields(){
       inp.dataset.intent=$('intent').value;
     }
   }
+  fillHints();
   $('out').innerHTML='';
+}
+// syncFields REWRITES the help HTML, which destroys anything render() put into it. So the live
+// values are filled right after, here, rather than only on the next 30s refresh — otherwise
+// switching mode shows "Now: —" until the poll catches up.
+function fillHints(){
+  if(!SNAP) return;
+  const a=$('curShare'), b=$('curFdv');
+  if(a) a.textContent=pct(SNAP.ledger.ours_share,2);
+  if(b) b.textContent=usd(SNAP.market.fdv);
 }
 $('intent').onchange=syncFields;
 // the composition panel answers "how far do the top wallets get me", so it must follow the
@@ -424,13 +445,9 @@ $('start').onclick=async()=>{
   if(r.error){$('out').innerHTML='<div class="adv bad">'+r.error+'</div>';return;}
   location.href=r.url;
 };
-// keep the "you hold X now" hints live
+// keep the "you hold X now" hints live on every poll too
 const _oldRender=render;
-render=function(s){ _oldRender(s);
-  const a=$('curShare'), b=$('curFdv');
-  if(a) a.textContent=pct(s.ledger.ours_share,2);
-  if(b) b.textContent=usd(s.market.fdv);
-};
+render=function(s){ _oldRender(s); fillHints(); };
 refresh(); setInterval(refresh,30000);
 </script>
 </main>
