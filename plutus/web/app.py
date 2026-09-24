@@ -493,6 +493,13 @@ async def api_refresh(token_id: int = 1, full: bool = False) -> JSONResponse:
                                    ("inventory", T.track_inventory, (True,)),
                                    ("census", T.track_census, ())):
                 j["stage"] = name
+                j.pop("progress", None)
+                if name == "inventory":
+                    # A sweep with no visible progress is indistinguishable from a hung one,
+                    # and the operator's only other signal is a page of zeros.
+                    def _p(d: int, n: int, _j=j) -> None:
+                        _j["progress"] = {"done": d, "of": n}
+                    args = (True, 3600, _p)
                 r = await asyncio.to_thread(fn, token_id, *args)
                 j["results"].append(vars(r))
         except Exception as exc:  # noqa: BLE001 — a failed pull must not wedge the button

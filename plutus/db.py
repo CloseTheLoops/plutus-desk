@@ -177,7 +177,8 @@ def classify(token_id: int, address: str, cls: str, source: str,
              label: str | None = None, evidence: str | None = None,
              confirmed: bool = False) -> None:
     """Set an address's class. An operator decision (source='operator') is never overwritten by a
-    later automatic pass — the same rule Apollo applies to operator-sourced wallet reputation."""
+    later automatic pass. An operator who classified a wallet by hand knows something the
+    heuristics do not, and a sweep that overwrites them destroys exactly that."""
     conn = connect()
     prev = conn.execute("SELECT source, confirmed FROM addresses WHERE token_id=? AND address=?",
                         (token_id, address)).fetchone()

@@ -15,6 +15,7 @@ measurement that made capture-rate possible, paying for itself twice.
 from __future__ import annotations
 
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
 from plutus import config, db
@@ -85,7 +86,16 @@ def track_tape(token_id: int) -> TickResult:
 
 
 # ── inventory ─────────────────────────────────────────────────────────────────
-def track_inventory(token_id: int, full: bool = False, window_s: int = 3600) -> TickResult:
+# How many balance reads run at once.  MEASURED, not guessed: one call costs ~0.54s, almost
+# all of it spawning a Node process, so 155 wallets take ~84s in a plain loop. A pool of 8
+# ran the same work 7.2x faster. The global pacer still caps the process at
+# 1/MIN_INTERVAL_S calls per second, so raising this trades latency for nothing once the
+# pacer binds -- it is deliberately well under that ceiling.
+BALANCE_WORKERS = 8
+
+
+def track_inventory(token_id: int, full: bool = False, window_s: int = 3600,
+                    progress=None) -> TickResult:
     """Our own holdings, by DIRECT per-wallet query. Never inferred from a ranked sweep —
     on the first token a ranked sweep saw barely a third of the operator's wallets; the direct query found all."""
     t0 = time.time()
@@ -113,18 +123,34 @@ def track_inventory(token_id: int, full: bool = False, window_s: int = 3600) -> 
 
     skipped = [w for w in targets if not config.is_address(chain, w)]
     targets = [w for w in targets if config.is_address(chain, w)]
+    # CONCURRENT, because the cost here is process startup, not rate limit. Sequentially this
+    # is ~0.54s per wallet and the operator watches a blank desk for a minute and a half while
+    # every derived figure reads zero. gmgn._pace() still enforces the global interval across
+    # these threads, so the burst ceiling is unchanged.
     rows, calls, failed = [], 0, []
-    for w in targets:
+
+    def _read(w: str):
         try:
-            bal, height = gmgn.token_balance(chain, w, address)
-            calls += 1
-            rows.append((w, bal, height))
+            return w, gmgn.token_balance(chain, w, address), None
         except gmgn.GmgnError as exc:
-            # A wallet we could not read is NOT a wallet holding nothing. It never reaches
-            # record_balances, so ledger falls back to 0.0 and the operator sees an empty desk.
-            # Count them and fail the tick, or the UI reports a clean sweep over missing data.
-            failed.append(w)
-            log.warning("balance failed for %s: %s", w[:10], exc)
+            return w, None, exc
+
+    done = 0
+    with ThreadPoolExecutor(max_workers=min(BALANCE_WORKERS, max(1, len(targets)))) as ex:
+        for w, got, exc in ex.map(_read, targets):
+            done += 1
+            if progress:
+                progress(done, len(targets))
+            if exc is not None:
+                # A wallet we could not read is NOT a wallet holding nothing. It never reaches
+                # record_balances, so ledger falls back to 0.0 and the operator sees an empty
+                # desk. Count them and fail the tick, or the UI reports a clean sweep over
+                # missing data.
+                failed.append(w)
+                log.warning("balance failed for %s: %s", w[:10], exc)
+            else:
+                calls += 1
+                rows.append((w, got[0], got[1]))
     db.record_balances(token_id, rows)
     ok = not failed
     return TickResult("inventory", ok, calls, time.time() - t0,

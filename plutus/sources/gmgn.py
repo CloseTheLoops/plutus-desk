@@ -21,6 +21,7 @@ import json
 import os
 import re
 import subprocess
+import threading
 import time
 from typing import Any
 
@@ -39,6 +40,7 @@ ANALYTICS_HOME = os.environ.get("PLUTUS_GMGN_HOME") or os.path.expanduser("~/.gm
 _FORBIDDEN = {("swap",), ("multi-swap",), ("order", "strategy")}
 
 _last_call = 0.0
+_rate_lock = threading.Lock()
 
 
 class GmgnError(RuntimeError):
@@ -79,6 +81,22 @@ def _env() -> dict[str, str] | None:
     return e
 
 
+def _pace() -> None:
+    """Hold the global minimum interval between calls, across threads.
+
+    This has to be a real lock now that the balance sweep calls concurrently. Without it every
+    worker reads the same `_last_call`, computes the same gap, sleeps it, and fires together --
+    which is precisely the burst the interval exists to prevent. The lock makes the interval a
+    property of the process rather than of each thread.
+    """
+    global _last_call
+    with _rate_lock:
+        gap = MIN_INTERVAL_S - (time.time() - _last_call)
+        if gap > 0:
+            time.sleep(gap)
+        _last_call = time.time()
+
+
 def _cooldown(err: str) -> int | None:
     if "RATE_LIMIT" not in err and "429" not in err:
         return None
@@ -100,10 +118,7 @@ def call(*args: str, attempts: int = 3) -> Any:
 
     cmd = [*CLI, *args, "--raw"]
     for attempt in range(1, attempts + 1):
-        gap = MIN_INTERVAL_S - (time.time() - _last_call)
-        if gap > 0:
-            time.sleep(gap)
-        _last_call = time.time()
+        _pace()
         try:
             p = subprocess.run(cmd, capture_output=True, text=True, timeout=TIMEOUT,
                                encoding="utf-8", env=_env(), creationflags=_NO_WINDOW)

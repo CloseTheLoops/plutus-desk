@@ -468,9 +468,13 @@ async function poll(){
   const st=$('pullSt');
   const j=await (await fetch('/api/refresh?token_id={{ token_id }}')).json();
   if(j.running){
-    st.innerHTML=`<span class="spin"></span> ${j.stage}… <span class="dim">`
+    // Show the wallet counter while the sweep runs. Without it a slow stage is
+    // indistinguishable from a hung one, and the operator's only other signal is a page
+    // of zeros that looks like real data.
+    const p=j.progress, prog=p&&p.of?` <b>${p.done}/${p.of}</b> wallets`:'';
+    st.innerHTML=`<span class="spin"></span> ${j.stage}…${prog} <span class="dim">`
       +`${j.results&&j.results.length?j.results.map(r=>r.name).join(' · ')+' done':''}</span>`;
-    return setTimeout(poll,1500);
+    return setTimeout(poll,1000);
   }
   st.innerHTML=(j.error?'<span class="bad">'+j.error+'</span> ':'')+summarise(j.results);
   $('pullQ').disabled=$('pullF').disabled=false;
