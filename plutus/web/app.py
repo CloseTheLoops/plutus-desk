@@ -8,13 +8,15 @@ added later; when it exists this page will write intents for it to poll, never c
 from __future__ import annotations
 
 import asyncio
+import hmac
 import json
+import os
 import threading
 import math
 import time
 from pathlib import Path
 
-from fastapi import Body, FastAPI, Query
+from fastapi import Body, FastAPI, Query, Request, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 
@@ -229,13 +231,14 @@ def _parse_excluded(chain: str, text: str) -> tuple[dict[str, str], list[str]]:
 
 
 @app.post("/api/onboard")
-async def api_onboard(payload: dict = Body(...)) -> JSONResponse:
+async def api_onboard(request: Request, payload: dict = Body(...)) -> JSONResponse:
     """Run discovery for a new token and start tracking it.
 
     The form writes a real `tokens/<label>.toml` + `wallets/<label>.txt` and then calls the SAME
     `onboard.discover()` the CLI uses. One code path, and the config stays portable and
     inspectable instead of living only in a database row.
     """
+    _require_operator(request)
     from plutus import onboard
 
     chain = (payload.get("chain") or "").strip()
@@ -321,8 +324,9 @@ async def api_onboard(payload: dict = Body(...)) -> JSONResponse:
 
 
 @app.post("/api/classify")
-def api_classify(payload: dict = Body(...)) -> JSONResponse:
+def api_classify(request: Request, payload: dict = Body(...)) -> JSONResponse:
     """Operator confirmations from the worksheet. source='operator' is never overwritten later."""
+    _require_operator(request)
     tid = int(payload.get("token_id") or 0)
     n = 0
     for c in payload.get("changes") or []:
@@ -425,12 +429,13 @@ def api_advice(token_id: int = 1, intent: str = Query("acquire"),
 
 
 @app.delete("/api/token/{token_id}")
-def api_delete_token(token_id: int, confirm: str = "") -> JSONResponse:
+def api_delete_token(request: Request, token_id: int, confirm: str = "") -> JSONResponse:
     """Erase one token and everything observed about it. Cannot be undone.
 
     `confirm` must match the token's own symbol or address. A delete button that fires on a
     single click eventually deletes the token the operator was only looking at.
     """
+    _require_operator(request)
     t = db.token_row(token_id)
     if t is None:
         return JSONResponse({"error": f"unknown token {token_id}"}, status_code=404)
@@ -507,7 +512,7 @@ def _refresh_if_stale(token_id: int) -> bool:
 
 
 @app.post("/api/refresh")
-async def api_refresh(token_id: int = 1, full: bool = False) -> JSONResponse:
+async def api_refresh(request: Request, token_id: int = 1, full: bool = False) -> JSONResponse:
     """Pull fresh data now.
 
     quick (default): pool reserves + trade tape. Cheap enough to run on a button.
@@ -516,6 +521,7 @@ async def api_refresh(token_id: int = 1, full: bool = False) -> JSONResponse:
                      rather than queued, because two censuses racing would interleave writes
                      into the same sweep.
     """
+    _require_operator(request)
     if db.token_row(token_id) is None:
         return JSONResponse({"error": f"unknown token {token_id}"}, status_code=404)
 
@@ -571,8 +577,9 @@ def api_refresh_status(token_id: int = 1) -> JSONResponse:
 
 
 @app.post("/api/campaign")
-async def api_campaign_create(payload: dict = Body(...)) -> JSONResponse:
+async def api_campaign_create(request: Request, payload: dict = Body(...)) -> JSONResponse:
     """Turn an intent into something that runs and is watched."""
+    _require_operator(request)
     tid = int(payload.get("token_id") or 1)
     kind = payload.get("kind")
     if kind not in ("acquire", "push", "distribute"):
@@ -635,7 +642,8 @@ def api_campaign_status(cid: int) -> JSONResponse:
 
 
 @app.post("/api/campaign/{cid}/stop")
-def api_campaign_stop(cid: int) -> JSONResponse:
+def api_campaign_stop(request: Request, cid: int) -> JSONResponse:
+    _require_operator(request)
     CP.stop(cid)
     return JSONResponse({"stopped": cid})
 
@@ -659,6 +667,50 @@ def campaign_page(cid: int) -> HTMLResponse:
 def api_worksheet(token_id: int = 1) -> JSONResponse:
     from plutus import onboard
     return JSONResponse(json.loads(json.dumps(onboard.worksheet(token_id), default=_safe)))
+
+
+# ── who may change things ─────────────────────────────────────────────────────
+# The page has no login, and six of its endpoints are destructive or expensive: delete a token
+# and everything observed about it, stop a running campaign, start one, burn API budget on a
+# full pull. That is fine while the only person who can reach it is the operator on this
+# machine, and stops being fine the moment the port is shared so someone can watch.
+#
+# So: the LOOPBACK caller is the operator and nothing changes for them. Anyone else is a viewer
+# and gets a read-only instance -- every GET works, every mutation is refused -- unless they
+# present PLUTUS_KEY, which is how the operator reaches their own desk from another machine.
+OPERATOR_KEY = os.environ.get("PLUTUS_KEY", "").strip()
+_LOOPBACK = {"127.0.0.1", "::1", "localhost", "::ffff:127.0.0.1"}
+
+
+def _is_operator(request: Request) -> bool:
+    host = (request.client.host if request.client else "") or ""
+    if host in _LOOPBACK:
+        return True
+    if OPERATOR_KEY:
+        given = (request.headers.get("X-Plutus-Key")
+                 or request.query_params.get("k") or "").strip()
+        # compare_digest so a wrong key cannot be found one character at a time
+        if given and hmac.compare_digest(given, OPERATOR_KEY):
+            return True
+    return False
+
+
+def _require_operator(request: Request) -> None:
+    if _is_operator(request):
+        return
+    raise HTTPException(
+        status_code=403,
+        detail="read-only: this view can watch but not change anything. "
+               + ("Add ?k=<your key> to act from another machine."
+                  if OPERATOR_KEY else
+                  "Set PLUTUS_KEY on the server to allow remote control."))
+
+
+@app.get("/api/whoami")
+def api_whoami(request: Request) -> JSONResponse:
+    """Lets the page hide controls it would only be refused for using."""
+    return JSONResponse({"operator": _is_operator(request),
+                         "remote_control": bool(OPERATOR_KEY)})
 
 
 # ── background task registry ──────────────────────────────────────────────────

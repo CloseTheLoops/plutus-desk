@@ -443,6 +443,24 @@ async function doDelete(){
   }catch(e){ st.textContent='delete failed: '+e; }
 }
 
+// ── viewer mode ──────────────────────────────────────────────────────────────
+// Everyone who can reach this port can read. Only the operator can change anything, and the
+// server enforces that. This just hides the controls a viewer would be refused for using --
+// a delete button that always errors is worse than no delete button.
+async function applyRole(ids){
+  try{
+    const w = await (await fetch('/api/whoami')).json();
+    if(w && w.operator) return;
+    ids.forEach(id => { const e = document.getElementById(id); if(e) e.style.display='none'; });
+    const b = document.createElement('div');
+    b.textContent = 'read-only view — you can watch, but not change anything';
+    b.style.cssText = 'font:12.5px system-ui;color:#8a8f98;border:1px solid #2a2f38;'
+      + 'border-radius:6px;padding:5px 11px;display:inline-block;margin-left:auto';
+    const h = document.querySelector('main > div') || document.body;
+    h.appendChild(b);
+  }catch(e){ /* if the probe fails, leave the page as it is; the server still refuses */ }
+}
+
 // ── pull fresh data on demand ────────────────────────────────────────────────
 async function pull(full){
   const q=$('pullQ'), f=$('pullF'), st=$('pullSt');
@@ -499,6 +517,7 @@ $('start').onclick=async()=>{
 // keep the "you hold X now" hints live on every poll too
 const _oldRender=render;
 render=function(s){ _oldRender(s); fillHints(); };
+applyRole(['pullQ','pullF','delBtn','delBar','ask','start']);
 refresh(); setInterval(refresh,30000);
 </script>
 </main>
