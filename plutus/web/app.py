@@ -268,11 +268,23 @@ async def api_onboard(payload: dict = Body(...)) -> JSONResponse:
     (config.TOKENS_DIR / f"{label}.toml").write_text(chr(10).join(lines), encoding="utf-8")
 
     cfg = config.load_token(label)
+    # Discovery is a slow multi-call operation and the button is clickable throughout it. Two
+    # concurrent runs for the same token duplicate every discovery call and interleave their
+    # writes. Refuse the second rather than queue it: the caller wants the result of the one
+    # already in flight, not a second copy of it.
+    ident = (chain, address.lower())
+    if ident in _onboarding:
+        return JSONResponse(
+            {"error": "discovery for this token is already running — wait for it to finish "
+                      "rather than starting a second scan"}, status_code=409)
+    _onboarding.add(ident)
     try:
         d = await asyncio.to_thread(onboard.discover, cfg)
     except Exception as exc:  # noqa: BLE001 — surface the real reason to the form
         log.exception("onboarding failed for %s", address[:12])
         return JSONResponse({"error": f"discovery failed: {exc}"}, status_code=500)
+    finally:
+        _onboarding.discard(ident)
 
     notes = list(d.notes)
     if problems:
@@ -282,8 +294,14 @@ async def api_onboard(payload: dict = Body(...)) -> JSONResponse:
         notes.append(f"{chain} has not been run end to end before — verify wallet attribution in "
                      f"the tape before trusting capture-rate on this token")
 
-    asyncio.create_task(_loop(d.token_id))
-    asyncio.create_task(asyncio.to_thread(T.track_inventory, d.token_id, True))
+    # Onboarding the same token twice must not stack a second loop or a second wallet scan.
+    # The scan is 155 sequential-ish reads; two of them race writes and take twice as long.
+    if _register(_loops, d.token_id, _loop(d.token_id)) is None:
+        notes.append("already tracking this token — did not start a second tracker loop")
+    if _register(_scans, d.token_id,
+                 asyncio.to_thread(T.track_inventory, d.token_id, True)) is None:
+        notes.append("a full wallet scan for this token is already running — not starting "
+                     "another; watch the pull status for its progress")
 
     cal = d.calibration or {}
     return JSONResponse(json.loads(json.dumps({
@@ -421,9 +439,14 @@ def api_delete_token(token_id: int, confirm: str = "") -> JSONResponse:
         return JSONResponse(
             {"error": f"confirm did not match — type {t['symbol'] or t['address']!r} exactly"},
             status_code=400)
+    # Cancel first. Deleting the rows out from under a running loop is what produced an
+    # endless `unknown token N` once the loop outlived what it was tracking.
+    stopped = _stop_tasks(token_id)
     res = db.delete_token(token_id)
-    log.warning("DELETED token %s (%s) — %d rows", token_id, t["symbol"], res["rows"])
-    return JSONResponse({"deleted": token_id, "symbol": t["symbol"], **res})
+    log.warning("DELETED token %s (%s) — %d rows, %d background task(s) cancelled",
+                token_id, t["symbol"], res["rows"], stopped)
+    return JSONResponse({"deleted": token_id, "symbol": t["symbol"],
+                         "tasks_cancelled": stopped, **res})
 
 
 @app.get("/holders", response_class=HTMLResponse)
@@ -638,10 +661,60 @@ def api_worksheet(token_id: int = 1) -> JSONResponse:
     return JSONResponse(json.loads(json.dumps(onboard.worksheet(token_id), default=_safe)))
 
 
+# ── background task registry ──────────────────────────────────────────────────
+# THREE BUGS THIS EXISTS TO PREVENT, all observed live:
+#   1. `create_task` results were dropped on the floor. Nothing held a reference, so the tasks
+#      could not be cancelled -- and asyncio is entitled to garbage-collect a task nobody holds,
+#      which makes a tracker silently stop instead of loudly failing.
+#   2. Onboarding ran `create_task(_loop(id))` unconditionally while startup had already started
+#      one. Re-onboarding a live token stacked a second loop on the same token_id: double the
+#      API calls, two inventory sweeps racing writes into the same table.
+#   3. Deleting a token cancelled nothing, so every orphaned loop kept ticking against a row
+#      that no longer existed, logging `unknown token N` every cycle, forever -- the loop is
+#      deliberately built to survive any error, which here meant surviving its own pointlessness.
+# Tokens whose discovery is in flight, keyed by (chain, address) because the token_id
+# does not exist yet on a first onboard.
+_onboarding: set[tuple[str, str]] = set()
+_loops: dict[int, asyncio.Task] = {}
+_scans: dict[int, asyncio.Task] = {}
+
+
+def _register(reg: dict, token_id: int, coro) -> asyncio.Task | None:
+    """Start a task for this token unless one is already live. Returns None if one was."""
+    old = reg.get(token_id)
+    if old is not None and not old.done():
+        coro.close()                       # never awaited; closing avoids a warning
+        return None
+    task = asyncio.create_task(coro)
+    reg[token_id] = task
+
+    def _drop(t: asyncio.Task, i: int = token_id) -> None:
+        if reg.get(i) is t:
+            reg.pop(i, None)
+    task.add_done_callback(_drop)
+    return task
+
+
+def _stop_tasks(token_id: int) -> int:
+    """Cancel everything running for a token. Called before its rows go away."""
+    n = 0
+    for reg in (_loops, _scans):
+        t = reg.pop(token_id, None)
+        if t is not None and not t.done():
+            t.cancel()
+            n += 1
+    return n
+
+
 async def _loop(token_id: int) -> None:
     """Background trackers. Every failure is logged and survived; one bad cycle never stops it."""
     last_inv = last_census = 0.0
     while True:
+        # Belt and braces: even if a cancel is missed, a loop whose token has been deleted
+        # exits instead of logging `unknown token N` on every cycle for the life of the process.
+        if db.token_row(token_id) is None:
+            log.info("token %s no longer exists — stopping its tracker loop", token_id)
+            return
         try:
             for r in (T.track_pool(token_id), T.track_tape(token_id)):
                 if not r.ok:
@@ -662,5 +735,5 @@ async def _loop(token_id: int) -> None:
 @app.on_event("startup")
 async def _startup() -> None:
     for t in db.all_tokens():
-        asyncio.create_task(_loop(t["id"]))
+        _register(_loops, t["id"], _loop(t["id"]))
         log.info("tracking %s (%s)", t["symbol"] or t["address"][:10], t["chain"])
