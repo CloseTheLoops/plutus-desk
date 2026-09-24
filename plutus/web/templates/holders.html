@@ -46,6 +46,19 @@
   .note.w{color:var(--warn)}
   .bar2{height:4px;background:#0a0d12;border-radius:2px;overflow:hidden;min-width:44px}
   .bar2 i{display:block;height:100%;background:var(--acc)}
+
+  .pull{display:flex;gap:7px;align-items:center;flex-wrap:wrap}
+  .pull button{background:#0a0d12;border:1px solid var(--line);color:var(--ink);
+    border-radius:6px;padding:6px 13px;font-size:12.5px;cursor:pointer;font-family:inherit}
+  .pull button:hover:not(:disabled){border-color:var(--acc);color:var(--acc)}
+  .pull button:disabled{opacity:.45;cursor:not-allowed}
+  .pull .st{font-size:11.5px;color:var(--dim)}
+  .spin{display:inline-block;width:11px;height:11px;border:2px solid var(--line);
+    border-top-color:var(--acc);border-radius:50%;animation:sp .8s linear infinite;vertical-align:-1px}
+  @keyframes sp{to{transform:rotate(360deg)}}
+  .copy{cursor:pointer;border-bottom:1px dotted var(--line)}
+  .copy:hover{color:var(--acc);border-bottom-color:var(--acc)}
+  .copied{color:var(--good)!important;border-bottom-color:transparent!important}
 </style>
 </head>
 <body>
@@ -54,6 +67,11 @@
   <h1>The float, wallet by wallet</h1>
   <a href="/?token_id={{ token_id }}" style="font-size:12.5px;text-decoration:none;
      border:1px solid var(--line);border-radius:6px;padding:5px 11px">← analysis</a>
+  <div class="pull" style="margin-left:auto">
+    <button id="pullQ" onclick="pull(false)" title="pool reserves + trade tape · ~2s">↻ pull</button>
+    <button id="pullF" onclick="pull(true)" title="also every wallet balance + the holder census · ~2min">↻↻ full pull</button>
+    <span class="st" id="pullSt"></span>
+  </div>
 </div>
 <div class="sub" id="sub">loading…</div>
 
@@ -170,7 +188,8 @@ function render(){
     const hit=need&&cutoff>=0&&i<=cutoff;
     return `<tr class="${h.fills_24h?'act':''}" ${hit?'style="background:#141f18"':''}>
       <td class="num dim">${i+1}</td>
-      <td><code>${h.address.slice(0,10)}…${h.address.slice(-6)}</code></td>
+      <td><code class="copy" data-full="${h.address}" title="click to copy the full address"
+        >${h.address.slice(0,10)}…${h.address.slice(-6)}</code></td>
       <td class="num">${num(h.tokens)}</td>
       <td class="num"><b>${pct(h.share_float,2)}</b></td>
       <td class="num dim">${pct(h.share_supply,3)}</td>
@@ -215,6 +234,63 @@ async function load(){
   const r=await fetch(`/api/holders?token_id={{ token_id }}&target=${t}`);
   DATA=await r.json(); render();
 }
+
+// ── click any address to copy it in full ─────────────────────────────────────
+// The tables show a truncated address because a 42-character string wrecks a column, but the
+// truncation is exactly what makes it useless for pasting into an explorer. Clicking copies the
+// whole thing from data-full, so the display can stay short without costing anything.
+function copyAddr(el){
+  const a=el.dataset.full||el.textContent.trim();
+  const done=()=>{const t=el.textContent; el.textContent='copied ✓'; el.classList.add('copied');
+    setTimeout(()=>{el.textContent=t; el.classList.remove('copied');},900);};
+  if(navigator.clipboard&&window.isSecureContext){ navigator.clipboard.writeText(a).then(done,()=>fb()); }
+  else fb();
+  function fb(){ // http://127.0.0.1 is a secure context in Chrome/Firefox, but not everywhere
+    const ta=document.createElement('textarea'); ta.value=a;
+    ta.style.cssText='position:fixed;opacity:0'; document.body.appendChild(ta);
+    ta.select(); try{document.execCommand('copy');done();}catch(e){}
+    document.body.removeChild(ta);
+  }
+}
+document.addEventListener('click',e=>{
+  const el=e.target.closest('.copy'); if(el) copyAddr(el);
+});
+
+// ── pull fresh data on demand ────────────────────────────────────────────────
+async function pull(full){
+  const q=$('pullQ'), f=$('pullF'), st=$('pullSt');
+  q.disabled=f.disabled=true;
+  st.innerHTML='<span class="spin"></span> ' + (full?'full pull — reserves, tape, every wallet balance, then the census':'pulling reserves and tape');
+  try{
+    const r=await (await fetch(`/api/refresh?token_id={{ token_id }}&full=${full?1:0}`,{method:'POST'})).json();
+    if(r.error){ st.innerHTML='<span class="bad">'+r.error+'</span>'; }
+    else if(r.running){ return poll(); }
+    else { st.innerHTML=summarise(r.results); await reload(); }
+  }catch(e){ st.innerHTML='<span class="bad">pull failed: '+e+'</span>'; }
+  q.disabled=f.disabled=false;
+}
+function summarise(rs){
+  if(!rs||!rs.length) return 'nothing returned';
+  const bad=rs.filter(r=>!r.ok);
+  return (bad.length?'<span class="warn">':'<span class="good">')
+    + rs.map(r=>`${r.name} ${r.ok?'ok':'FAILED'}`).join(' · ')
+    + `</span> <span class="dim">· ${rs.reduce((a,r)=>a+(r.calls||0),0)} calls, `
+    + `${rs.reduce((a,r)=>a+(r.seconds||0),0).toFixed(1)}s</span>`;
+}
+async function poll(){
+  const st=$('pullSt');
+  const j=await (await fetch('/api/refresh?token_id={{ token_id }}')).json();
+  if(j.running){
+    st.innerHTML=`<span class="spin"></span> ${j.stage}… <span class="dim">`
+      +`${j.results&&j.results.length?j.results.map(r=>r.name).join(' · ')+' done':''}</span>`;
+    return setTimeout(poll,1500);
+  }
+  st.innerHTML=(j.error?'<span class="bad">'+j.error+'</span> ':'')+summarise(j.results);
+  $('pullQ').disabled=$('pullF').disabled=false;
+  await reload();
+}
+
+const reload=load;
 load(); setInterval(load,60000);
 </script>
 </main>

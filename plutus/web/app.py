@@ -38,6 +38,11 @@ CENSUS_S = 3600      # full census + full inventory reconciliation
 
 _state: dict[int, dict] = {}
 
+# On-demand pulls. A quick pull is one pool call plus the free tape (~2s). A full pull also
+# re-runs the per-wallet inventory and the 36-call census (~2min), so it cannot block a request
+# — it runs in the background and the page polls this.
+_jobs: dict[int, dict] = {}
+
 
 def _build_stamp() -> dict:
     """What code is this process actually running?
@@ -375,6 +380,63 @@ def api_holders(token_id: int = 1, target: float = 0.0) -> JSONResponse:
                    **(H.reachable_by(v, need) if need else {})},
         "holders": [vars(h) for h in v.holders],
     }, default=_safe)))
+
+
+@app.post("/api/refresh")
+async def api_refresh(token_id: int = 1, full: bool = False) -> JSONResponse:
+    """Pull fresh data now.
+
+    quick (default): pool reserves + trade tape. Cheap enough to run on a button.
+    full:            also inventory and the holder census. Minutes, so it is a background job
+                     and the caller polls; starting a second one while one runs is refused
+                     rather than queued, because two censuses racing would interleave writes
+                     into the same sweep.
+    """
+    if db.token_row(token_id) is None:
+        return JSONResponse({"error": f"unknown token {token_id}"}, status_code=404)
+
+    job = _jobs.get(token_id)
+    if job and job.get("running"):
+        return JSONResponse({"running": True, "stage": job.get("stage"),
+                             "started": job.get("started"),
+                             "note": "a pull is already in progress"})
+
+    if not full:
+        res = [await asyncio.to_thread(T.track_pool, token_id),
+               await asyncio.to_thread(T.track_tape, token_id)]
+        _jobs[token_id] = {"running": False, "finished": db.now(), "kind": "quick",
+                           "results": [vars(r) for r in res]}
+        return JSONResponse({"running": False, "kind": "quick",
+                             "results": [vars(r) for r in res], "finished": db.now()})
+
+    _jobs[token_id] = {"running": True, "kind": "full", "stage": "starting",
+                       "started": db.now(), "results": []}
+
+    async def run() -> None:
+        j = _jobs[token_id]
+        try:
+            for name, fn, args in (("pool", T.track_pool, ()), ("tape", T.track_tape, ()),
+                                   ("inventory", T.track_inventory, (True,)),
+                                   ("census", T.track_census, ())):
+                j["stage"] = name
+                r = await asyncio.to_thread(fn, token_id, *args)
+                j["results"].append(vars(r))
+        except Exception as exc:  # noqa: BLE001 — a failed pull must not wedge the button
+            log.exception("full pull failed")
+            j["error"] = str(exc)[:200]
+        finally:
+            j["running"] = False
+            j["stage"] = "done"
+            j["finished"] = db.now()
+
+    asyncio.create_task(run())
+    return JSONResponse({"running": True, "kind": "full", "stage": "starting",
+                         "started": db.now()})
+
+
+@app.get("/api/refresh")
+def api_refresh_status(token_id: int = 1) -> JSONResponse:
+    return JSONResponse(_jobs.get(token_id, {"running": False, "stage": None}))
 
 
 @app.get("/api/worksheet")
