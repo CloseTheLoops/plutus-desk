@@ -26,8 +26,15 @@
   .hdr div{min-width:92px}
   .hdr b{display:block;font-size:19px;font-variant-numeric:tabular-nums;line-height:1.2}
   .hdr span{font-size:10px;color:var(--dim);text-transform:uppercase;letter-spacing:.05em}
-  .bar{display:flex;height:26px;border-radius:5px;overflow:hidden;margin:10px 0 6px;font-size:10.5px}
-  .bar div{display:flex;align-items:center;justify-content:center;color:#0e1116;font-weight:700;min-width:0}
+  /* Segments are sized ONLY by flex-basis, with grow and shrink both off. Using width:% on a
+     flex child lets flex resize it around its label, so a long label makes its segment wider
+     than its share and squeezes the rest — the proportions stop being true, which is the one
+     thing a proportion bar has to be. */
+  .bar{display:flex;height:28px;border-radius:5px;overflow:hidden;margin:10px 0 6px;font-size:10.5px}
+  .bar div{flex:0 0 auto;display:flex;align-items:center;justify-content:center;
+    color:#0e1116;font-weight:700;min-width:0;overflow:hidden;white-space:nowrap;
+    box-shadow:inset -1px 0 0 rgba(14,17,22,.35)}
+  .bar div:last-child{box-shadow:none}
   .legend{display:flex;gap:13px;flex-wrap:wrap;font-size:11px;color:var(--dim)}
   .legend span::before{content:"■ "}
   .grid2{display:grid;grid-template-columns:1fr 1fr;gap:12px}
@@ -214,8 +221,16 @@ let render=function render(s){
 
   const seg=[['burnt',L.burnt,'#3d4757'],['ours',L.ours,'#7a5cd6'],['pool',L.pool,'#539bf5'],
              ['locked',L.locked,'#d4a72c'],['float',L.float,'#4cc38a'],['unaccounted',L.unaccounted,'#e5534b']];
-  $('bar').innerHTML=seg.map(([n,v,c])=>{const w=100*v/L.nominal;
-    return w>0.05?`<div style="width:${w}%;background:${c}">${w>7?n+' '+w.toFixed(1)+'%':''}</div>`:''}).join('');
+  // Label whatever fits: name+% when there is room, bare % when there is only a little, and a
+  // tooltip always — so no segment is ever an unexplained coloured block. A 5% slice used to
+  // render with no label at all because the threshold was 7%.
+  $('bar').innerHTML=seg.map(([n,v,c])=>{
+    const w=100*v/L.nominal;
+    if(w<=0) return '';
+    const lab = w>=7.5 ? `${n} ${w.toFixed(1)}%` : w>=3 ? `${w.toFixed(1)}%` : '';
+    return `<div style="flex-basis:${w}%;background:${c}" title="${n}: ${num(v)} tokens · `
+      +`${w.toFixed(2)}% of total supply">${lab}</div>`;
+  }).join('');
   $('legend').innerHTML='<span style="color:#8b95a5;border:0;margin-right:4px">bar = share of TOTAL supply:</span>'
     +seg.map(([n,v,c])=>`<span style="color:${c}">${n} ${pct(v/L.nominal,1)}</span>`).join('');
   $('denom').innerHTML=`<b>Two denominators, and the page uses both on purpose.</b>
