@@ -562,7 +562,7 @@ async def api_refresh(request: Request, token_id: int = 1, full: bool = False) -
                     # and the operator's only other signal is a page of zeros.
                     def _p(d: int, n: int, _j=j) -> None:
                         _j["progress"] = {"done": d, "of": n}
-                    args = (True, 3600, _p)
+                    args = (True, 3600, _p, True)      # fresh: an explicit pull, never a copy
                 r = await asyncio.to_thread(fn, token_id, *args)
                 j["results"].append(vars(r))
         except Exception as exc:  # noqa: BLE001 — a failed pull must not wedge the button
@@ -911,9 +911,32 @@ def _stop_tasks(token_id: int) -> int:
     return n
 
 
+def _inventory_busy(token_id: int) -> bool:
+    """Is a full read of this token's wallets already running (onboarding scan or full pull)?"""
+    scan = _scans.get(token_id)
+    if scan is not None and not scan.done():
+        return True
+    job = _jobs.get(token_id) or {}
+    return bool(job.get("running")) and job.get("kind") == "full"
+
+
 async def _loop(token_id: int) -> None:
-    """Background trackers. Every failure is logged and survived; one bad cycle never stops it."""
-    last_inv = last_census = 0.0
+    """Background trackers. Every failure is logged and survived; one bad cycle never stops it.
+
+    TWO THINGS THIS DOES DIFFERENTLY, both found by working through a 500-wallet campaign:
+
+    * It does not start a full wallet read while one is already running. Onboarding starts its
+      own scan, and this loop used to start a SECOND full read on its first cycle -- every
+      wallet read twice. At 150 wallets that went unnoticed; at 500 it was ~1,050 calls against
+      a 900-an-hour budget before a campaign had even begun.
+    * Its timers come from what the database already holds, not zero. A server restarted ten
+      minutes after a full sweep does not redo it just because an in-memory timer reset.
+
+    And every network call runs in a thread. Calling them directly in this coroutine froze the
+    whole web server -- every page, every viewer -- for the length of each call.
+    """
+    last_census = float(db.latest_census_ts(token_id) or 0)
+    last_inv = last_full_try = 0.0
     while True:
         # Belt and braces: even if a cancel is missed, a loop whose token has been deleted
         # exits instead of logging `unknown token N` on every cycle for the life of the process.
@@ -921,17 +944,25 @@ async def _loop(token_id: int) -> None:
             log.info("token %s no longer exists — stopping its tracker loop", token_id)
             return
         try:
-            for r in (T.track_pool(token_id), T.track_tape(token_id)):
+            for fn in (T.track_pool, T.track_tape):
+                r = await asyncio.to_thread(fn, token_id)
                 if not r.ok:
                     log.warning("%s: %s", r.name, r.detail)
             now = time.time()
             if now - last_census > CENSUS_S:
                 await asyncio.to_thread(T.track_census, token_id)
-                await asyncio.to_thread(T.track_inventory, token_id, True)
-                last_census = last_inv = now
-            elif now - last_inv > INVENTORY_S:
-                await asyncio.to_thread(T.track_inventory, token_id, False)
-                last_inv = now
+                await asyncio.to_thread(T.track_pool, token_id, True)   # re-check the free source
+                last_census = now
+            if not _inventory_busy(token_id):
+                st = db.stalest_balance_ts(token_id)
+                full_due = ((st is None or now - st > CENSUS_S)
+                            and now - last_full_try > INVENTORY_S)
+                if full_due:
+                    await asyncio.to_thread(T.track_inventory, token_id, True)
+                    last_full_try = last_inv = now
+                elif now - last_inv > INVENTORY_S:
+                    await asyncio.to_thread(T.track_inventory, token_id, False)
+                    last_inv = now
         except Exception:                       # noqa: BLE001 — the loop never dies of one cycle
             log.exception("tracker cycle failed")
         await asyncio.sleep(TICK_S)

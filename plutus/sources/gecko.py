@@ -110,8 +110,42 @@ def trades(network: str, pool: str, quick: bool = False) -> list[dict]:
             "to_amount": to,
             "base_amount": base_amt,
             "price_usd": price,
+            # The block the fill landed in. It is what lets a balance read be rolled forward
+            # exactly: fills in later blocks are not in that read, fills at or before it are.
+            "block": int(a["block_number"]) if a.get("block_number") else None,
         })
     return out
+
+
+# The trades endpoint returns a FIXED WINDOW of the most recent fills, not a page. Measured
+# 2026-09-25 at exactly 300. A response of this size may have cut off older fills, which is what
+# tells track_tape a gap is possible. Re-verify if the vendor changes it: a smaller real window
+# would make every full response look complete.
+TRADES_WINDOW = 300
+
+
+def pool(network: str, pool_id: str) -> dict | None:
+    """Pool reserves from the free source, DERIVED, or None if it cannot be derived.
+
+    The endpoint gives the pool's total USD value and prices, not raw reserves. On a full-range
+    constant-product pool both sides hold equal value at the current price, so each side is half
+    the total and the reserves follow. On a concentrated-liquidity pool that is false -- measured
+    150-240% wrong on one -- which is why a token only uses this after a parity check against
+    GMGN passes (see trackers.track_pool). This function derives; it does not vouch.
+
+    Uses the pool's own base-in-quote price rather than the ratio of the two USD prices: the USD
+    prices come from other pools and at other times, and measured 1.8% apart from the in-pool one.
+    """
+    d = _get(f"/networks/{network}/pools/{pool_id}")
+    a = ((d or {}).get("data") or {}).get("attributes") or {}
+    usd = _f(a.get("reserve_in_usd"))
+    quote_usd = _f(a.get("quote_token_price_usd"))
+    spot = _f(a.get("base_token_price_quote_token"))
+    if not (usd > 0 and quote_usd > 0 and spot > 0):
+        return None
+    quote_reserve = usd / 2 / quote_usd
+    return {"base_reserve": quote_reserve / spot, "quote_reserve": quote_reserve,
+            "spot": spot, "reserve_usd": usd}
 
 
 def _iso(s: str | None) -> int:

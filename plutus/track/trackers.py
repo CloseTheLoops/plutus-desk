@@ -42,24 +42,70 @@ def _ctx(token_id: int) -> tuple[str, str, str]:
 
 
 # ── pool ──────────────────────────────────────────────────────────────────────
-def track_pool(token_id: int) -> TickResult:
+def track_pool(token_id: int, verify: bool = False) -> TickResult:
     if aborted(token_id):
         return TickResult("pool", False, 0, 0.0,
                           "skipped — the token was deleted")
     t0 = time.time()
     chain, address, primary = _ctx(token_id)
-    try:
-        p = gmgn.token_pool(chain, address)
-    except gmgn.GmgnError as exc:
-        return TickResult("pool", False, 1, time.time() - t0, str(exc)[:120])
-    base = float(p.get("base_reserve") or 0)
-    quote = float(p.get("quote_reserve") or 0)
+
+    # WHY NOT JUST SWITCH TO THE FREE SOURCE. Reading reserves from GeckoTerminal costs nothing
+    # against the GMGN budget, which is what keeps a campaign's prices live while a big wallet
+    # sweep is spending that budget. But the free source gives a pool's USD value, not its
+    # reserves, and deriving reserves from it is only right on a full-range pool. Measured on
+    # the same day: FAITH within 1%, another Robinhood token off by 150-240%. So each token is
+    # CHECKED against GMGN -- on first use and hourly -- and reads from the free source only
+    # while that check passes. A token that fails keeps reading GMGN exactly as before.
+    free = None
+    if primary:
+        try:
+            free = gecko.pool(config.chain(chain).gecko_network, primary)
+        except Exception as exc:                          # noqa: BLE001 — the free source is optional
+            log.debug("free pool read failed for token %s: %s", token_id, exc)
+
+    last = db.latest_pool_parity(token_id)
+    trusted = bool(last and last["ok"])
+    fresh_check = bool(last and db.now() - last["ts"] <= PARITY_TTL_S)
+    need_check = free is not None and (verify or not fresh_check)
+
+    vendor, calls, note = None, 0, ""
+    if need_check or not (free is not None and trusted):
+        try:
+            vendor = gmgn.token_pool(chain, address, fresh=need_check)
+            calls += 1
+        except gmgn.GmgnError as exc:
+            if not (free is not None and trusted):
+                return TickResult("pool", False, calls, time.time() - t0, str(exc)[:120])
+            note = f" · could not re-check against GMGN ({str(exc)[:60]}), kept the free source"
+
+    if need_check and vendor:
+        vr, vq = float(vendor.get("base_reserve") or 0), float(vendor.get("quote_reserve") or 0)
+        if vr and vq:
+            rd = free["base_reserve"] / vr - 1
+            qd = free["quote_reserve"] / vq - 1
+            sd = free["spot"] / (vq / vr) - 1
+            ok = all(abs(x) <= PARITY_TOLERANCE for x in (rd, qd, sd))
+            db.record_pool_parity(token_id, rd, qd, sd, ok)
+            trusted = ok
+            if not ok:
+                log.info("token %s: free pool source disagrees with GMGN (R %+.1f%% Q %+.1f%% "
+                         "spot %+.1f%%) — staying on GMGN", token_id, rd * 100, qd * 100, sd * 100)
+
+    if free is not None and trusted:
+        base, quote, liq, source = (free["base_reserve"], free["quote_reserve"],
+                                    free["reserve_usd"], "gecko")
+    elif vendor:
+        base = float(vendor.get("base_reserve") or 0)
+        quote = float(vendor.get("quote_reserve") or 0)
+        liq, source = float(vendor.get("liquidity") or 0), "gmgn"
+    else:
+        return TickResult("pool", False, calls, time.time() - t0, "no usable pool source")
     if not (base and quote):
-        return TickResult("pool", False, 1, time.time() - t0, "empty reserves")
-    db.record_pool(token_id, primary or p.get("pool_address") or "?", base, quote,
-                   float(p.get("liquidity") or 0), "gmgn")
-    return TickResult("pool", True, 1, time.time() - t0,
-                      f"R {base:,.0f} Q {quote:,.2f} spot {quote/base:.6e}")
+        return TickResult("pool", False, calls, time.time() - t0, "empty reserves")
+    db.record_pool(token_id, primary or (vendor or {}).get("pool_address") or "?", base, quote,
+                   liq, source)
+    return TickResult("pool", True, calls, time.time() - t0,
+                      f"R {base:,.0f} Q {quote:,.2f} spot {quote/base:.6e} via {source}" + note)
 
 
 # ── tape ──────────────────────────────────────────────────────────────────────
@@ -73,8 +119,21 @@ def track_tape(token_id: int) -> TickResult:
     if not primary:
         return TickResult("tape", False, 0, 0.0, "no primary venue yet — run onboarding")
     net = config.chain(chain).gecko_network
+    last_block = db.last_trade_block(token_id)
     fills = gecko.trades(net, primary)
     ours = {a for a, c in db.class_map(token_id).items() if c == "ours"}
+
+    # A FULL window whose oldest fill is newer than the newest one already stored means fills in
+    # between were never seen -- a burst of buys faster than one poll can do exactly this. Balances
+    # rolled forward from fills would then undercount, so the gap is recorded and the inventory
+    # sweep re-reads the wallets whose last read predates it.
+    blocks = [f["block"] for f in fills if f.get("block")]
+    gap = (last_block is not None and blocks and len(fills) >= gecko.TRADES_WINDOW
+           and min(blocks) > last_block)
+    if gap:
+        db.record_tape_gap(token_id, last_block, min(blocks))
+        log.warning("tape gap on token %s: nothing seen between blocks %s and %s",
+                    token_id, last_block, min(blocks))
 
     rows, mine = [], 0
     for f in fills:
@@ -86,10 +145,12 @@ def track_tape(token_id: int) -> TickResult:
         rows.append((token_id, f["tx_hash"], 0, primary, f["ts"], f["side"],
                      f["usd"], f.get("base_amount") or
                      (f["to_amount"] if f["side"] == "buy" else f["from_amount"]),
-                     f["price_usd"], maker, int(is_ours), "geckoterminal"))
+                     f["price_usd"], maker, int(is_ours), "geckoterminal", f.get("block")))
     new = db.record_trades(rows)
     return TickResult("tape", True, 1, time.time() - t0,
-                      f"{len(rows)} fills seen, {new} new, {mine} ours")
+                      f"{len(rows)} fills seen, {new} new, {mine} ours"
+                      + (" · GAP: fills may have been missed, affected wallets will be re-read"
+                         if gap else ""))
 
 
 # ── inventory ─────────────────────────────────────────────────────────────────
@@ -99,6 +160,15 @@ def track_tape(token_id: int) -> TickResult:
 # 1/MIN_INTERVAL_S calls per second, so raising this trades latency for nothing once the
 # pacer binds -- it is deliberately well under that ceiling.
 BALANCE_WORKERS = 8
+
+# Calls held back from every sweep so a live campaign can still read prices and quotes when a
+# large inventory sweep would otherwise spend the hour's budget.
+BUDGET_RESERVE = 50
+
+# The free pool source is trusted for a token only while its latest check against GMGN agreed
+# within this much on reserves and price, and only for this long before re-checking.
+PARITY_TOLERANCE = 0.03
+PARITY_TTL_S = 3600
 
 # ── stopping work that is already in flight ───────────────────────────────────
 # WHY A FLAG AND NOT A CANCEL. Every long scan runs under `asyncio.to_thread`, and cancelling
@@ -131,7 +201,7 @@ def clear_abort(token_id: int) -> None:
 
 
 def track_inventory(token_id: int, full: bool = False, window_s: int = 3600,
-                    progress=None) -> TickResult:
+                    progress=None, fresh: bool = False) -> TickResult:
     """Our own holdings, by DIRECT per-wallet query. Never inferred from a ranked sweep —
     on the first token a ranked sweep saw barely a third of the operator's wallets; the direct query found all."""
     t0 = time.time()
@@ -148,17 +218,57 @@ def track_inventory(token_id: int, full: bool = False, window_s: int = 3600,
     if full:
         targets = ours + others
     else:
-        seen = {r["maker"] for r in db.connect().execute(
-            "SELECT DISTINCT maker FROM trades WHERE token_id=? AND ts>=?",
-            (token_id, db.now() - window_s)).fetchall() if r["maker"]}
-        known = set(db.latest_balances(token_id))
-        # the pool moves on every fill, so it is always re-read; the rest only when they traded
-        targets = sorted((set(ours) & seen) | (set(ours) - known)
+        rows = db.latest_balance_rows(token_id)
+        known = set(rows)
+        # Our wallets are NOT re-read just because they traded: their fills roll the last read
+        # forward (see ledger.build). That was the cost that made a 500-wallet campaign
+        # impossible -- every buy wave demanded 500 calls every five minutes. They are re-read
+        # only when never read, or when a gap in the trade feed means their roll-forward may be
+        # missing fills.
+        gap_ts = db.latest_tape_gap_ts(token_id)
+        behind_gap = {a for a in ours if gap_ts and a in rows and rows[a][2] < gap_ts}
+        # the pool moves on every fill, so it is always re-read
+        targets = sorted((set(ours) - known) | behind_gap
                          | {a for a in others if cmap[a] == "pool"}
                          | (set(others) - known))
 
     skipped = [w for w in targets if not config.is_address(chain, w)]
     targets = [w for w in targets if config.is_address(chain, w)]
+
+    # SPEND ONLY WHAT THE BUDGET ALLOWS, MOST IMPORTANT FIRST. Each of our wallets is its own
+    # last read plus its own fills, so a partial sweep is no longer an inconsistent one: reading
+    # the wallets the budget can afford now and the rest next hour leaves every wallet
+    # individually correct. So a sweep that does not fit is not refused -- it reads what fits,
+    # in priority order, and keeps a reserve so a live campaign can still price. A read the
+    # cache can serve costs nothing and needs no allowance.
+    latest = db.latest_balance_rows(token_id)
+    gap_ts = db.latest_tape_gap_ts(token_id)
+
+    def priority(w: str) -> tuple:
+        cls = cmap.get(w)
+        if cls == "pool":
+            return (0, 0)                      # the ledger is meaningless without the pool
+        if w not in latest:
+            return (1 if cls != "ours" else 2, 0)
+        if cls == "ours" and gap_ts and latest[w][2] < gap_ts:
+            return (3, latest[w][2])           # its roll-forward may be missing fills
+        return (4, latest[w][2])               # then stalest first
+
+    targets.sort(key=priority)
+    deferred: list[str] = []
+    left = gmgn.budget().get("hour_left")
+    if left is not None:
+        allowance = max(0, left - BUDGET_RESERVE)
+        chosen = []
+        for w in targets:
+            if not fresh and gmgn.balance_cached(chain, w, address):
+                chosen.append(w)
+            elif allowance > 0:
+                chosen.append(w)
+                allowance -= 1
+            else:
+                deferred.append(w)
+        targets = chosen
     # CONCURRENT, because the cost here is process startup, not rate limit. Sequentially this
     # is ~0.54s per wallet and the operator watches a blank desk for a minute and a half while
     # every derived figure reads zero. gmgn._pace() still enforces the global interval across
@@ -171,9 +281,10 @@ def track_inventory(token_id: int, full: bool = False, window_s: int = 3600,
         if aborted(token_id):
             return w, None, "aborted"
         try:
-            # `full` is the operator pressing "full pull". That is an explicit request for
-            # current numbers, so it goes past the cache; the background delta sweep does not.
-            return w, gmgn.token_balance(chain, w, address, fresh=full), None
+            # `fresh` is the operator pressing "full pull": an explicit request for current
+            # numbers, so it goes past the cache. Onboarding and the background sweeps use it --
+            # which is what makes deleting and re-adding a token within minutes cost nothing.
+            return w, gmgn.token_balance(chain, w, address, fresh=fresh), None
         except gmgn.GmgnError as exc:
             return w, None, exc
 
@@ -202,8 +313,14 @@ def track_inventory(token_id: int, full: bool = False, window_s: int = 3600,
                           f"ABORTED after {calls} of {len(targets)} wallets — {skipped} calls "
                           f"not made because the token was deleted")
     db.record_balances(token_id, rows)
-    ok = not failed
+    ok = not failed and not deferred
+    if deferred:
+        log.info("inventory for token %s: %d wallet(s) deferred to protect the hourly budget",
+                 token_id, len(deferred))
     return TickResult("inventory", ok, calls, time.time() - t0,
+                      (f"{len(deferred)} of {len(targets) + len(deferred)} wallets DEFERRED — "
+                       f"the hour's API budget is committed; they are read next as it frees · "
+                       if deferred else "") +
                       f"{'FULL' if full else 'delta'} · {len(rows)} of "
                       f"{len(ours)+len(others)} addresses ({calls} calls, {time.time()-t0:.1f}s)"
                       + (f" · skipped {len(skipped)} non-address ids" if skipped else "")
@@ -227,6 +344,11 @@ def track_census(token_id: int) -> TickResult:
     """
     t0 = time.time()
     chain, address, _ = _ctx(token_id)
+    need = len(ORDER_BYS) + len(TAGS) * len(TAG_ORDER_BYS)
+    left = gmgn.budget().get("hour_left")
+    if left is not None and need > left - BUDGET_RESERVE:
+        return TickResult("census", False, 0, time.time() - t0,
+                          f"DEFERRED — a census needs {need} calls and {left} are left this hour")
     rows: dict[str, dict] = {}
     tagged: dict[str, set[str]] = {}
     calls = slices = 0

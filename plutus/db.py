@@ -82,6 +82,7 @@ CREATE TABLE IF NOT EXISTS trades (
   pool_address TEXT, ts INTEGER NOT NULL,
   side TEXT, usd REAL, tokens REAL, price REAL,
   maker TEXT, is_ours INTEGER DEFAULT 0, source TEXT,
+  block INTEGER,                   -- chain block of the fill; lets a balance be rolled forward exactly
   PRIMARY KEY (token_id, tx_hash, log_idx)
 );
 CREATE INDEX IF NOT EXISTS idx_trades_ts ON trades(token_id, ts);
@@ -117,6 +118,26 @@ CREATE TABLE IF NOT EXISTS ticks (
   regime TEXT, reasoning TEXT, snapshot TEXT,
   PRIMARY KEY (token_id, ts)
 );
+
+-- Does the free pool source agree with GMGN for THIS token? Measured, never assumed: on a
+-- full-range pool the two agree within ~1%, on a concentrated-liquidity pool the free source's
+-- derived reserves were off by 150-240%. A token reads reserves from the free source only while
+-- its latest check passed.
+CREATE TABLE IF NOT EXISTS pool_parity (
+  token_id INTEGER NOT NULL, ts INTEGER NOT NULL,
+  r_diff REAL, q_diff REAL, spot_diff REAL, ok INTEGER NOT NULL,
+  PRIMARY KEY (token_id, ts)
+);
+
+-- The trade feed returns a fixed window of recent fills. When a full window arrives that does
+-- not reach back to the newest fill already stored, fills in between were never seen. Balances
+-- rolled forward from fills cannot be trusted across such a gap, so it is recorded and the
+-- affected wallets are re-read.
+CREATE TABLE IF NOT EXISTS tape_gaps (
+  token_id INTEGER NOT NULL, ts INTEGER NOT NULL,
+  after_block INTEGER, before_block INTEGER,
+  PRIMARY KEY (token_id, ts)
+);
 """
 
 _conn: sqlite3.Connection | None = None
@@ -131,9 +152,17 @@ def connect() -> sqlite3.Connection:
         c.execute("PRAGMA synchronous=NORMAL")
         c.execute("PRAGMA busy_timeout=10000")
         c.executescript(SCHEMA)
+        _migrate(c)
         c.commit()
         _conn = c
     return _conn
+
+
+def _migrate(c: sqlite3.Connection) -> None:
+    """Bring an older database up to the current schema. Additive only; never drops data."""
+    cols = {r[1] for r in c.execute("PRAGMA table_info(trades)").fetchall()}
+    if "block" not in cols:
+        c.execute("ALTER TABLE trades ADD COLUMN block INTEGER")
 
 
 def now() -> int:
@@ -232,7 +261,11 @@ def record_trades(rows: list[tuple]) -> int:
         return 0
     conn = connect()
     before = conn.total_changes
-    conn.executemany("INSERT OR IGNORE INTO trades VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", rows)
+    # Named columns, so a column added later can never shift a value into the wrong field.
+    rows = [tuple(r) + (None,) * (13 - len(r)) for r in rows]
+    conn.executemany(
+        "INSERT OR IGNORE INTO trades (token_id, tx_hash, log_idx, pool_address, ts, side, usd, "
+        "tokens, price, maker, is_ours, source, block) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
     conn.commit()
     return conn.total_changes - before
 
@@ -241,7 +274,7 @@ def record_trades(rows: list[tuple]) -> int:
 # each delete -- a table added later and not listed here would quietly survive a wipe the
 # operator believes finished, which is the worst possible outcome for a delete button.
 TOKEN_KEYED = ("venues", "addresses", "calibration", "pool_obs", "trades", "balances",
-               "census", "census_meta", "ticks", "campaigns")
+               "census", "census_meta", "ticks", "campaigns", "pool_parity", "tape_gaps")
 
 
 def delete_token(token_id: int) -> dict:
@@ -297,6 +330,105 @@ def latest_balances(token_id: int) -> dict[str, tuple[float, int | None]]:
              SELECT MAX(observed_ts) FROM balances WHERE token_id=b.token_id AND address=b.address)""",
         (token_id,)).fetchall()
     return {r["address"]: (r["tokens"], r["height"]) for r in rows}
+
+
+def latest_balance_rows(token_id: int) -> dict[str, tuple[float, int | None, int]]:
+    """Most recent observation per address, with WHEN it was taken: (tokens, height, observed_ts)."""
+    rows = connect().execute(
+        """SELECT address, tokens, height, observed_ts FROM balances b
+           WHERE token_id=? AND observed_ts=(
+             SELECT MAX(observed_ts) FROM balances WHERE token_id=b.token_id AND address=b.address)""",
+        (token_id,)).fetchall()
+    return {r["address"]: (r["tokens"], r["height"], r["observed_ts"]) for r in rows}
+
+
+# A PREFILTER, not the rule: only fills this long before the oldest read are even considered.
+# The vendor's indexer runs behind the chain, so a fill can predate a read in wall-clock time and
+# still be missing from it; the block comparison is what actually decides. Wide on purpose -- too
+# narrow silently drops fills the indexer was slow on, too wide only costs rows scanned.
+INDEX_LAG_S = 3600
+
+
+def fills_after(token_id: int,
+                state: dict[str, tuple[int | None, int]]) -> dict[str, tuple[float, int]]:
+    """Net tokens each address gained from fills NOT reflected in its last balance read.
+
+    `state` maps address -> (height, observed_ts) of that read. THE RULE: a fill counts when its
+    block is later than the block at which the balance last changed. That is exact, and it stays
+    exact when the vendor's indexer lags -- a fill it had not indexed yet has a later block than
+    the balance it reported, so it is counted; a fill it had indexed moved the balance's height to
+    at least its own block, so it is not. Only when a block is missing on either side does this
+    fall back to comparing times.
+    """
+    if not state:
+        return {}
+    oldest = min(obs for _h, obs in state.values())
+    rows = connect().execute(
+        "SELECT maker, side, tokens, block, ts FROM trades WHERE token_id=? AND ts>=?",
+        (token_id, oldest - INDEX_LAG_S)).fetchall()
+    out: dict[str, list] = {}
+    for r in rows:
+        a = r["maker"]
+        if a not in state or not r["tokens"]:
+            continue
+        height, observed = state[a]
+        if r["block"] is not None and height is not None:
+            counts = r["block"] > height
+        else:
+            counts = r["ts"] > observed
+        if not counts:
+            continue
+        acc = out.setdefault(a, [0.0, 0])
+        acc[0] += r["tokens"] if r["side"] == "buy" else -r["tokens"]
+        acc[1] += 1
+    return {a: (v[0], v[1]) for a, v in out.items()}
+
+
+def last_trade_block(token_id: int) -> int | None:
+    row = connect().execute("SELECT MAX(block) b FROM trades WHERE token_id=?",
+                            (token_id,)).fetchone()
+    return row["b"] if row else None
+
+
+def record_tape_gap(token_id: int, after_block: int | None, before_block: int | None) -> None:
+    connect().execute("INSERT OR IGNORE INTO tape_gaps VALUES (?,?,?,?)",
+                      (token_id, now(), after_block, before_block))
+    connect().commit()
+
+
+def latest_tape_gap_ts(token_id: int) -> int | None:
+    row = connect().execute("SELECT MAX(ts) t FROM tape_gaps WHERE token_id=?",
+                            (token_id,)).fetchone()
+    return row["t"] if row else None
+
+
+def record_pool_parity(token_id: int, r_diff: float, q_diff: float, spot_diff: float,
+                       ok: bool) -> None:
+    connect().execute("INSERT OR REPLACE INTO pool_parity VALUES (?,?,?,?,?,?)",
+                      (token_id, now(), r_diff, q_diff, spot_diff, int(ok)))
+    connect().commit()
+
+
+def latest_pool_parity(token_id: int) -> sqlite3.Row | None:
+    return connect().execute(
+        "SELECT * FROM pool_parity WHERE token_id=? ORDER BY ts DESC LIMIT 1",
+        (token_id,)).fetchone()
+
+
+def stalest_balance_ts(token_id: int) -> int | None:
+    """When the OLDEST classified balance was last read; None if none has been read at all.
+
+    A full reconciliation is due when this is old. Computing it from stored reads rather than an
+    in-memory timer means a server restarted ten minutes after a full sweep does not redo it.
+    """
+    classified = {r["address"] for r in connect().execute(
+        "SELECT address FROM addresses WHERE token_id=? AND class IN "
+        "('ours','pool','burnt','locked','unknown')", (token_id,)).fetchall()}
+    seen = [obs for a, (_t, _h, obs) in latest_balance_rows(token_id).items() if a in classified]
+    # Over wallets that HAVE been read. One that never has -- a read that keeps failing, one
+    # added later -- is picked up by the delta sweep; letting it make "stalest" None would make
+    # a full re-read of every wallet due on every cycle.
+    return min(seen) if seen else None
 
 
 def latest_census_ts(token_id: int) -> int | None:

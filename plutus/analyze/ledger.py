@@ -155,8 +155,40 @@ def build(token_id: int) -> Ledger:
     for r in classes:
         by_class.setdefault(r["class"], []).append(r["address"])
 
-    balances = db.latest_balances(token_id)
     notes: list[str] = []
+
+    # OUR POSITION IS ROLLED FORWARD FROM OUR OWN FILLS. Re-reading every wallet after every
+    # buy wave costs one vendor call per wallet -- 500 wallets is 500 calls every few minutes,
+    # far past the hourly budget -- while the trade feed already records, for free, every fill
+    # those wallets made. So each of our wallets is its last real read plus the fills that read
+    # cannot contain (db.fills_after has the exact rule). Real reads still happen: on first
+    # sight, after a feed gap, and at the hourly reconciliation that catches what fills cannot
+    # see (transfers, other venues, staking).
+    rows = db.latest_balance_rows(token_id)
+    balances = {a: (tok, h) for a, (tok, h, _obs) in rows.items()}
+    ours_addrs = by_class.get("ours", [])
+    state = {a: (rows[a][1], rows[a][2]) for a in ours_addrs if a in rows}
+    rolled = db.fills_after(token_id, state)
+    negative = []
+    for a, (delta, _n) in rolled.items():
+        tok, h = balances[a]
+        if tok + delta < -1e-9:
+            negative.append(a)
+        balances[a] = (max(0.0, tok + delta), h)
+    if rolled:
+        n_fills = sum(n for _d, n in rolled.values())
+        notes.append(f"{len(rolled)} of our wallets include {n_fills} fill(s) made since their "
+                     f"last balance read, taken from the trade feed")
+    if negative:
+        notes.append(f"{len(negative)} of our wallets sold more than their last read held — "
+                     f"tokens moved in from outside the tracked pool; shown as 0 until re-read")
+    gap_ts = db.latest_tape_gap_ts(token_id)
+    if gap_ts:
+        behind = [a for a in ours_addrs if a in rows and rows[a][2] < gap_ts]
+        if behind:
+            notes.append(f"the trade feed missed some fills; {len(behind)} of our wallets were "
+                         f"last read before that, so our position may be UNDERSTATED until they "
+                         f"are re-read (the inventory sweep does this automatically)")
 
     def held(addresses: list[str]) -> tuple[float, int]:
         total, n = 0.0, 0

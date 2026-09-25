@@ -193,3 +193,28 @@ single point of failure.
 **Rate limits are shared per API key, not per process.** The pacer's clock lives in the database,
 so the service and any CLI command coordinate automatically — but only if they use the same
 `data/` directory. Two checkouts with separate databases are two independent budgets.
+
+## Staying inside the API budget at scale
+
+GMGN calls are capped per hour (`PLUTUS_MAX_CALLS_HOUR`, default 900). Three things keep a large
+campaign — measured with 500 wallets — well inside it:
+
+- **Your position is rolled forward from your own fills.** Each of your wallets is its last real
+  balance read plus the fills the free trade feed has seen since, counted by block so nothing is
+  double-counted. Wallets are no longer re-read just because they traded: an hour of tracking
+  after a 500-wallet buy costs about a dozen calls instead of several thousand. Real reads still
+  happen on first sight, after a gap in the trade feed (the feed returns a fixed window; a burst
+  faster than one poll can outrun it, and the page says so), and at the hourly reconciliation that
+  catches what fills cannot see — transfers, other venues, staking.
+- **Pool prices come from GeckoTerminal where that is proven safe.** Each token is checked against
+  GMGN on first use and hourly; it reads the free source only while the two agree within 3%.
+  Full-range pools pass. Concentrated-liquidity pools do not — one measured 150–240% off — and
+  stay on GMGN. Once trusted, a token's prices stay live even when the hour's GMGN budget is spent.
+- **Sweeps read what the budget allows, most important first.** A sweep that does not fit is not
+  refused: it reads the pool first, then never-read wallets, then the stalest, keeps 50 calls in
+  reserve for prices and quotes, and picks up the rest as the hourly window frees. Onboarding no
+  longer reads every wallet twice.
+
+The steady cost of a 500-wallet token is dominated by the hourly reconciliation (one read per
+wallet per hour). If that is too much alongside other tokens, `CENSUS_S` in `plutus/web/app.py`
+sets its interval.

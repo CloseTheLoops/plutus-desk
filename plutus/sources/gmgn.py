@@ -493,8 +493,19 @@ def token_info(chain: str, address: str) -> dict:
     return d if isinstance(d, dict) else {}
 
 
-def token_pool(chain: str, address: str) -> dict:
-    return call("token", "pool", "--chain", chain, "--address", address) or {}
+def token_pool(chain: str, address: str, fresh: bool = False) -> dict:
+    return call("token", "pool", "--chain", chain, "--address", address, fresh=fresh) or {}
+
+
+def balance_cached(chain: str, wallet: str, token: str) -> bool:
+    """Would token_balance for this wallet be served from cache right now -- i.e. cost nothing?
+
+    Lets a sweep plan against the budget: a cached read is free, so it never needs allowance.
+    The key must match token_balance's call exactly, or everything looks uncached.
+    """
+    hit, _ = _cache_get(("portfolio", "token-balance", "--chain", chain, "--wallet", wallet,
+                         "--token", token))
+    return hit
 
 
 def token_security(chain: str, address: str) -> dict:
