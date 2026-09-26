@@ -54,6 +54,8 @@ TAPE_FAST_S = 10
 # ledger already has every holder -- runs.
 LEDGER_S = 30
 LEDGER_RETRY_S = 600
+LEDGER_RESUME_S = 120
+ONBOARD_LEDGER_WAIT_S = 300    # onboarding waits this long for a first ledger build
 CENSUS_EXACT_S = 6 * 3600
 INVENTORY_S = 300    # delta inventory
 CENSUS_S = 3600      # full census + full inventory reconciliation
@@ -642,7 +644,7 @@ async def api_refresh(request: Request, token_id: int = 1, full: bool = False) -
                 j["stage"] = name
                 j.pop("progress", None)
                 if name == "inventory" and _ledger_ok(token_id):
-                    r = await asyncio.to_thread(T.track_ledger, token_id)
+                    r = await asyncio.to_thread(T.track_ledger, token_id, True)
                     j["results"].append(vars(r))
                     if r.ok:
                         continue                   # exact balances; no wallet sweep needed
@@ -668,11 +670,17 @@ async def api_refresh(request: Request, token_id: int = 1, full: bool = False) -
 
 
 @app.get("/api/refresh")
+@app.get("/api/refresh_status")
 def api_refresh_status(token_id: int = 1) -> JSONResponse:
-    """One status source for both kinds of background work.
+    """One status source for every kind of background work on a token.
 
-    A full pull registers in _jobs; the onboarding scan registers in _scans. The page should not
-    have to know which started its work, so both are reported here.
+    A full pull registers in _jobs; the onboarding scan in _scan_state; a transfer-ledger sync
+    (from either, or the loop) in trackers.ledger_progress. The page should not have to know
+    which started its work, so all are reported here.
+
+    SERVED AT BOTH URLS. The worksheet polls /api/refresh_status; this was only registered at
+    /api/refresh, so every poll 404'd, the page read that as "no scan running" and unlocked Save
+    over an empty worksheet. tests/test_routes.py now requests every URL the templates use.
     """
     j = dict(_jobs.get(token_id, {"running": False, "stage": None}))
     s = _scan_state.get(token_id)
@@ -681,6 +689,12 @@ def api_refresh_status(token_id: int = 1) -> JSONResponse:
         if s.get("running"):
             j["running"] = True
             j["stage"] = j.get("stage") or "inventory"
+    lp = T.ledger_progress.get(token_id)
+    if lp is not None:
+        j["ledger"] = dict(lp)
+    st = db.ledger_state(token_id)
+    j["ledger_state"] = ({"synced_block": st["synced_block"], "verified": st["verified_ok"] == 1,
+                          "exact": db.ledger_healthy(token_id)} if st else None)
     return JSONResponse(j)
 
 
@@ -965,10 +979,33 @@ async def _onboard_scan(token_id: int) -> None:
         r = None
         if t is not None and _E.available(t["chain"]):
             # The transfer ledger reads EVERY holder exactly for a few calls; no wallet sweep.
+            # wait=True: if the tracker loop is already syncing it, wait for that sync rather
+            # than skip to a 476-wallet GMGN read.
             st["stage"] = "ledger"
-            r = await asyncio.to_thread(T.track_ledger, token_id)
+            # Bounded: a throttled node can take many minutes. Past ONBOARD_LEDGER_WAIT_S the
+            # worksheet reads balances from GMGN (operator tier) while the ledger keeps
+            # building in its thread -- different APIs, no contention -- and takes over when done.
+            job = asyncio.ensure_future(asyncio.to_thread(T.track_ledger, token_id, True))
+            job.add_done_callback(lambda f: f.cancelled() or f.exception())  # never "unretrieved"
+            try:
+                r = await asyncio.wait_for(asyncio.shield(job), ONBOARD_LEDGER_WAIT_S)
+                st["ledger"] = {"ok": r.ok, "detail": r.detail}
+            except asyncio.TimeoutError:
+                lp = T.ledger_progress.get(token_id) or {}
+                r = None
+                st["ledger"] = {"ok": False, "detail": (
+                    f"still building (block {lp.get('block') or 0:,} of {lp.get('to') or 0:,}) — "
+                    "reading balances from GMGN meanwhile; the ledger takes over when done")}
         if r is None or not r.ok:
-            r = await asyncio.to_thread(T.track_inventory, token_id, True, 3600, progress)
+            # The operator asked for this onboarding, so its balance read is on the OPERATOR
+            # tier, like a full pull -- explicitly. A background-tier read on a day whose
+            # background share was spent read zero wallets and left the worksheet empty.
+            st["stage"] = "balances"
+            r = await asyncio.to_thread(T.track_inventory, token_id, True, 3600, progress,
+                                        background=False)
+            if r.status in ("partial", "deferred") or (r.of and not r.done):
+                st["balances_problem"] = (
+                    f"read {r.done or 0} of {r.of or '?'} wallet balances — {r.detail}")
         st.update(ok=r.ok, detail=r.detail)
         # The first pool check and the first census belong to ONBOARDING, which the operator
         # asked for -- not to the background loop. Left to the loop, a 458-wallet onboarding had
@@ -1103,9 +1140,13 @@ async def _loop(token_id: int) -> None:
                 r = await asyncio.to_thread(T.track_ledger, token_id)
                 if r.ok:
                     said.pop("ledger", None)
+                elif r.status == "skipped":
+                    pass                                # another sync of it is running
                 else:
                     once("ledger", f"token {token_id} transfer ledger: {r.detail}")
-                    ledger_retry_at = now + LEDGER_RETRY_S
+                    # A backfill interrupted by 429s kept its progress: resume soon, not in 10m.
+                    ledger_retry_at = now + (LEDGER_RESUME_S if "progress kept" in r.detail
+                                             else LEDGER_RETRY_S)
             exact = db.ledger_healthy(token_id)
             if now < paused_until:
                 await asyncio.sleep(TAPE_FAST_S if burst else TICK_S)

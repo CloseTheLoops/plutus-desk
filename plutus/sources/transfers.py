@@ -23,7 +23,7 @@ class Source:
     def latest_block(self) -> int: ...
     def decimals(self, token: str) -> int: ...
     def token_supply(self, token: str, block: int | None = None) -> int: ...
-    def transfer_logs(self, token: str, lo: int, hi: int) -> list[dict]: ...
+    def transfer_logs(self, token: str, lo: int, hi: int, on_chunk=None) -> list[dict]: ...
     def calls(self) -> int: ...
 
 
@@ -41,8 +41,11 @@ class RpcSource(Source):
     def token_supply(self, token, block=None):
         return self._w(chainrpc.token_supply, self.chain, token, block)
 
-    def transfer_logs(self, token, lo, hi):
-        return self._w(chainrpc.transfer_logs, self.chain, token, lo, hi)
+    def transfer_logs(self, token, lo, hi, on_chunk=None):
+        try:
+            return chainrpc.transfer_logs(self.chain, token, lo, hi, on_chunk=on_chunk)
+        except chainrpc.RpcError as exc:
+            raise LedgerSourceError(str(exc)) from exc
 
     def calls(self):
         return chainrpc.calls()
@@ -69,8 +72,12 @@ class EtherscanSource(Source):
     def token_supply(self, token, block=None):          # Etherscan reads the latest supply only
         return self._w(etherscan.token_supply, self.cid, token)
 
-    def transfer_logs(self, token, lo, hi):
-        return self._w(etherscan.transfer_logs, self.cid, token, lo, hi)
+    def transfer_logs(self, token, lo, hi, on_chunk=None):
+        logs = self._w(etherscan.transfer_logs, self.cid, token, lo, hi)
+        if on_chunk is None:
+            return logs
+        on_chunk(logs, hi)
+        return []
 
     def calls(self):
         return etherscan.budget().get("day") or 0

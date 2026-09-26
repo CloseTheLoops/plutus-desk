@@ -217,6 +217,7 @@ token's own `balanceOf`. What the public node does, and how the reader copes (re
 | state kept for ~1,000 blocks only | supply read at the synced block, right after syncing |
 | logs carry no timestamp (`0x0`) | block times fetched in batches of 50 |
 | no published rate limit ("not for production") | ~4 calls a minute needed; all processes paced together at `PLUTUS_RPC_RPS` (default 4) |
+| throttles with HTTP 429 under load | exponential back-off per host (2s → 120s, `Retry-After` honoured), narrower ranges, and the backfill **commits as it goes** — an interrupted build resumes from its last finished block, across restarts |
 
 Add or replace endpoints with `PLUTUS_RPC_<CHAIN>=url1,url2` (e.g. a free Alchemy URL); a
 second endpoint is only used for blocks it has itself reached. Only Robinhood has a default;
@@ -227,6 +228,10 @@ other chains need an endpoint set this way, or an Etherscan key.
 forces one. Etherscan's Robinhood-chain access needs the Lite plan ($49/mo) from 2026-10-16.
 Rejected free alternatives (2026-09-26): dRPC's keyless tier (refused 1,000-block ranges, no
 state at a block), Blockscout (Cloudflare challenge on scripted requests).
+
+Onboarding waits up to 5 minutes for a first ledger build (progress is shown on the worksheet);
+past that it reads balances from GMGN on the operator tier while the ledger finishes in the
+background, and the ledger takes over when it is exact.
 
 `python -m plutus.cli doctor <token>` shows the source, the syncable head, and whether the ledger
 sums to supply. `PLUTUS_LIVE_TESTS=1 python tests/test_live_ledger.py` rebuilds FAITH's ledger

@@ -175,6 +175,12 @@ $('go').onclick=async()=>{
   $('go').disabled=false;
   if(r.error){ $('out').innerHTML='<div class="card"><span class="bad">'+r.error+'</span></div>'; return; }
 
+  show(r);
+};
+
+// Draw the discovery card and the worksheet, then wait for the scan. Called again with a
+// fresh worksheet when the scan lands (this used to call a render function that did not exist).
+function show(r){
   const d=r.discovery, ws=r.worksheet||[];
   const review=ws.filter(x=>x.needs_review), assumed=ws.filter(x=>x.assumed);
   $('out').innerHTML=`<div class="card">
@@ -233,34 +239,79 @@ $('go').onclick=async()=>{
   //
   // Gated on the scan actually finishing, never on a timer: real scans have run from ~10s to
   // over two minutes depending on wallet count and API conditions.
+  // SAVE UNLOCKS ONLY ON A POSITIVE ANSWER. It used to unlock whenever the status poll did not
+  // report a running scan -- and the poll was 404ing, so a missing answer read as "finished"
+  // and Save went live over an empty worksheet. Now: an error, a non-200 or an unreadable reply
+  // keeps it locked and keeps polling; it unlocks only when the server says the scan is done
+  // AND the worksheet has something to review. An empty worksheet says why instead.
   (async function awaitScan(){
     const note=$('scanNote'), btn=$('save'), t0=Date.now();
+    let fails=0;
+    const esc=s=>String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+    const ledgerLine=L=>{
+      if(!L||!L.running) return '';
+      const span=(L.to!=null&&L.from!=null)?Math.max(1,L.to-L.from):null;
+      const done=(span&&L.block!=null)?Math.min(100,Math.max(0,100*(L.block-L.from+1)/span)):null;
+      return ` building the transfer ledger${L.backfill?' (first full history)':''}: block `
+        + `<b>${L.block!=null?num(L.block):'…'}</b> of ${L.to!=null?num(L.to):'…'}`
+        + (done!=null?` (${done.toFixed(0)}%)`:'') + ` · ${num(L.transfers||0)} transfers`;
+    };
+    const getWs=async()=>{
+      const q=await fetch('/api/worksheet?token_id='+r.token_id);
+      if(!q.ok) throw new Error('worksheet HTTP '+q.status);
+      const w=await q.json();
+      if(!Array.isArray(w)) throw new Error('worksheet reply unreadable');
+      return w;
+    };
     for(;;){
-      let j=null;
-      try{ j=await (await fetch('/api/refresh_status?token_id='+r.token_id)).json(); }
-      catch(e){ /* transient — keep waiting */ }
-      const s=j&&j.scan, secs=Math.round((Date.now()-t0)/1000);
-      if(s&&s.running){
-        const prog=(s.of? ` <b>${s.done}/${s.of}</b> wallets` : '');
-        note.innerHTML=`<span class="spin"></span> scanning wallets${prog} · ${secs}s elapsed`
-          + ' — saving is held until this finishes, so the review step is not skipped.';
-      }else if(s&&!s.running){
-        // Re-fetch the worksheet: the one on screen was built before the sweep landed.
-        try{
-          const w=await (await fetch('/api/worksheet?token_id='+r.token_id)).json();
-          if(Array.isArray(w)&&w.length!==ws.length){
-            note.innerHTML=`<span class="good">✓ scan complete in ${secs}s</span> — the`
-              + ` worksheet now has <b>${w.length}</b> addresses; reloading it.`;
-            r.worksheet=w; setTimeout(()=>render(r),900); return;
-          }
-        }catch(e){ /* fall through and just unlock */ }
-        note.innerHTML=`<span class="good">✓ scan complete in ${secs}s</span>`
-          + (s.ok===false? ` <span class="warn">— ${s.detail||'it did not finish cleanly'}</span>`:'');
-        btn.disabled=false; return;
-      }else if(secs>10){
-        // No scan was registered for this token (already onboarded, or it finished before the
-        // first poll). Nothing to wait for.
-        note.textContent='no background scan is running for this token.';
+      const secs=Math.round((Date.now()-t0)/1000);
+      let j=null, why='';
+      try{
+        const q=await fetch('/api/refresh_status?token_id='+r.token_id);
+        if(!q.ok) why='HTTP '+q.status;
+        else{ j=await q.json(); if(!j||typeof j!=='object'){ j=null; why='unreadable reply'; } }
+      }catch(e){ why=String(e); }
+      if(!j){
+        fails++;
+        note.innerHTML=`<span class="warn">! cannot read the scan status (${esc(why)})</span> — `
+          + `Save stays locked until it can; retrying${fails>3?' — if this persists, check the server log':''}.`;
+        await new Promise(z=>setTimeout(z,Math.min(10000,1500*fails)));
+        continue;
+      }
+      fails=0;
+      const s=j.scan, L=j.ledger;
+      if((s&&s.running)||(!s&&L&&L.running)){
+        const prog=(s&&s.of? ` <b>${s.done}/${s.of}</b> wallets`:'');
+        note.innerHTML=`<span class="spin"></span> ${s&&s.stage==='balances'?'reading wallet balances':'scanning'}${prog}`
+          + `${ledgerLine(L)} · ${secs}s elapsed — saving is held until this finishes, so the review step is not skipped.`;
+      }else if(s || secs>10){
+        // Finished (or nothing registered after 10s): the worksheet decides.
+        let w=null;
+        try{ w=await getWs(); }
+        catch(e){
+          note.innerHTML=`<span class="warn">! scan finished but the worksheet could not be read (${esc(e.message)})</span> — Save stays locked; retrying.`;
+          await new Promise(z=>setTimeout(z,3000)); continue;
+        }
+        const problem=(s&&s.balances_problem)||'';
+        if(!w.length){
+          const reasons=[problem, s&&s.ok===false?s.detail:'', s&&s.ledger&&!s.ledger.ok?'transfer ledger: '+s.ledger.detail:'']
+            .filter(Boolean);
+          note.innerHTML=`<span class="bad">✗ no balances could be read, so there is nothing to review yet.</span>`
+            + (reasons.length?`<div class="dim" style="margin-top:4px">${reasons.map(esc).join('<br>')}</div>`
+                             :' <span class="dim">no scan is running for this token.</span>')
+            + `<div style="margin-top:4px">Save stays locked. The tracker keeps building the ledger in the background; `
+            + `open the analysis and run a full pull once it reports balances, or re-open this worksheet later.</div>`;
+          return;
+        }
+        if(w.length!==ws.length){
+          note.innerHTML=`<span class="good">✓ scan complete in ${secs}s</span> — the`
+            + ` worksheet now has <b>${w.length}</b> addresses; reloading it.`;
+          r.worksheet=w; setTimeout(()=>show(r),900); return;
+        }
+        const building=L&&L.running?`<div class="dim">${ledgerLine(L)} — exact balances replace these when it finishes.</div>`:'';
+        note.innerHTML=`<span class="good">✓ scan complete in ${secs}s</span>` + building
+          + (problem?` <span class="warn">— ${esc(problem)}. The worksheet covers only what was read.</span>`
+            : s&&s.ok===false? ` <span class="warn">— ${esc(s.detail||'it did not finish cleanly')}</span>`:'');
         btn.disabled=false; return;
       }
       await new Promise(z=>setTimeout(z,1500));
@@ -273,7 +324,7 @@ $('go').onclick=async()=>{
       body:JSON.stringify({token_id:r.token_id,changes})});
     location.href='/?token_id='+r.token_id;
   };
-};
+}
 </script>
 </main>
 </body>

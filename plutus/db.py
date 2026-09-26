@@ -604,8 +604,13 @@ def ledger_state(token_id: int) -> sqlite3.Row | None:
     return connect().execute("SELECT * FROM ledger_state WHERE token_id=?", (token_id,)).fetchone()
 
 
-def apply_transfers(token_id: int, logs: list[dict], decimals: int, synced_block: int) -> int:
+def apply_transfers(token_id: int, logs: list[dict], decimals: int, synced_block: int,
+                    caught_up: bool = True) -> int:
     """Insert new transfers and apply ONLY the new ones to holdings, exactly. Returns how many.
+
+    `caught_up=False` commits a finished CHUNK of a longer sync: `synced_block` advances so an
+    interrupted backfill resumes after it, but `synced_ts` does not -- the ledger is only
+    "fresh" once it has reached the head.
 
     Idempotent: a transfer already stored is never applied twice, so overlapping fetches (the
     block-paged sync re-reads a boundary block on purpose) cannot double-count.
@@ -637,7 +642,8 @@ def apply_transfers(token_id: int, logs: list[dict], decimals: int, synced_block
     c.execute("INSERT INTO ledger_state (token_id, synced_block, decimals, synced_ts) "
               "VALUES (?,?,?,?) ON CONFLICT(token_id) DO UPDATE SET "
               "synced_block=excluded.synced_block, decimals=excluded.decimals, "
-              "synced_ts=excluded.synced_ts", (token_id, synced_block, decimals, now()))
+              "synced_ts=COALESCE(excluded.synced_ts, ledger_state.synced_ts)",
+              (token_id, synced_block, decimals, now() if caught_up else None))
     c.commit()
     return new
 

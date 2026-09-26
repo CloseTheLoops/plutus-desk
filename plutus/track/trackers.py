@@ -124,17 +124,43 @@ def track_pool(token_id: int, verify: bool = False, background: bool = False) ->
 LEDGER_VERIFY_S = 3600
 
 
-def track_ledger(token_id: int) -> TickResult:
+# One ledger sync per token at a time. The onboarding scan and the tracker loop both sync, and
+# two concurrent backfills of the same token doubled the RPC load that drew the 429s.
+_ledger_locks: dict[int, threading.Lock] = {}
+_ledger_locks_guard = threading.Lock()
+# What a running sync is doing, for the page: {running, stage, from, to, block, transfers, ...}.
+ledger_progress: dict[int, dict] = {}
+
+
+class _Deleted(Exception):
+    pass
+
+
+def track_ledger(token_id: int, wait: bool = False) -> TickResult:
     """Bring the transfer ledger up to the chain head, and check it against total supply.
 
     The first run backfills from the token's first block; every run after fetches only blocks
-    since the last. Balances derived from it are exact, so the hourly check is exact too: the
+    since the last. A backfill COMMITS AS IT GOES: an interruption (429s that outlast the
+    back-off, a restart, a network drop) resumes from the last finished block instead of
+    starting over. Balances derived from it are exact, so the hourly check is exact too: the
     holdings must sum to total supply to the last unit, or the ledger is rebuilt rather than
     trusted. Supply is read AT the synced block where the source allows (the free RPC does), so
     a transfer landing between the two reads cannot make a good ledger look wrong.
 
-    The source is the chain's free RPC where there is one, else Etherscan with a key.
+    `wait=True` waits for a sync already running for this token instead of skipping.
     """
+    with _ledger_locks_guard:
+        lock = _ledger_locks.setdefault(token_id, threading.Lock())
+    if not lock.acquire(blocking=wait):
+        return TickResult("ledger", False, 0, 0.0, "a ledger sync for this token is already "
+                          "running", status="skipped")
+    try:
+        return _track_ledger(token_id)
+    finally:
+        lock.release()
+
+
+def _track_ledger(token_id: int) -> TickResult:
     if aborted(token_id):
         return TickResult("ledger", False, 0, 0.0, "skipped — the token was deleted",
                           status="skipped")
@@ -150,57 +176,82 @@ def track_ledger(token_id: int) -> TickResult:
     def used() -> int:
         return max(0, src.calls() - before)
 
+    prog = {"running": True, "stage": "sync", "started": db.now(), "from": None, "to": None,
+            "block": None, "transfers": 0, "backfill": False, "detail": ""}
+    ledger_progress[token_id] = prog
     try:
         st = db.ledger_state(token_id)
         dec = st["decimals"] if st else src.decimals(address)
         start = st["synced_block"] + 1 if st else 0
         head = src.latest_block()
+        prog.update(stage="backfill" if (st is None or not st["verified_ts"]) else "sync",
+                    backfill=st is None or not st["verified_ts"], to=head, block=start - 1)
+        prog["from"] = start
         new = 0
+
+        def on_chunk(logs: list[dict], through: int) -> None:
+            nonlocal new
+            if aborted(token_id):                       # deleted mid-backfill: write nothing more
+                raise _Deleted()
+            new += db.apply_transfers(token_id, logs, dec, through, caught_up=through >= head)
+            prog.update(block=through, transfers=new)
+
         if head >= start:
-            logs = src.transfer_logs(address, start, head)
-            if aborted(token_id):                       # deleted while the backfill ran:
-                return TickResult("ledger", False, used(), time.time() - t0,   # write nothing
-                                  "skipped — the token was deleted", status="skipped")
-            new = db.apply_transfers(token_id, logs, dec, head)
+            src.transfer_logs(address, start, head, on_chunk=on_chunk)
         else:
             head = start - 1                            # a lagging node: nothing new, keep ours
         detail = f"synced to block {head:,} · {new} new transfer(s)"
-    except transfers.LedgerSourceError as exc:
+    except _Deleted:
+        prog.update(running=False, detail="the token was deleted")
         return TickResult("ledger", False, used(), time.time() - t0,
-                          f"{src.name}: {str(exc)[:280]}", status="failed")
+                          "skipped — the token was deleted", status="skipped")
+    except transfers.LedgerSourceError as exc:
+        st2 = db.ledger_state(token_id)
+        kept = (f" · progress kept to block {st2['synced_block']:,}, resuming from there"
+                if st2 else "")
+        prog.update(running=False, detail=f"{str(exc)[:200]}{kept}")
+        return TickResult("ledger", False, used(), time.time() - t0,
+                          f"{src.name}: {str(exc)[:240]}{kept}", status="failed")
 
+    prog["stage"] = "verify"
     st = db.ledger_state(token_id)
     due = (st is not None and (not st["verified_ts"] or st["verified_ok"] != 1
            or db.now() - st["verified_ts"] >= LEDGER_VERIFY_S))
-    if due:
-        try:
-            supply = src.token_supply(address, head)
-            held = db.holdings_sum_raw(token_id)
-            if held != supply:
-                # A source that can only read the LATEST supply may be ahead of the ledger.
-                # Catch up once before calling it wrong.
-                head2 = src.latest_block()
-                if head2 > head:
-                    new += db.apply_transfers(
-                        token_id, src.transfer_logs(address, head + 1, head2), dec, head2)
-                    held = db.holdings_sum_raw(token_id)
-                    supply = src.token_supply(address, head2)
-        except transfers.LedgerSourceError as exc:
-            # The sync itself worked; only the check could not run. Try again next pass --
-            # the ledger stops counting as exact if checks keep failing (db.LEDGER_VERIFIED_S).
-            return TickResult("ledger", True, used(), time.time() - t0,
-                              detail + f" · supply check deferred ({str(exc)[:120]})",
-                              status="ok")
-        ok = held == supply
-        db.set_ledger_verified(token_id, ok)
-        if not ok:
-            log.warning("transfer ledger for token %s is off total supply by %d raw units — "
-                        "rebuilding it from the first block", token_id, supply - held)
-            db.reset_ledger(token_id)
-            return TickResult("ledger", False, used(), time.time() - t0,
-                              "did not reconcile to supply — rebuilding", status="failed")
-        detail += " · reconciles to total supply exactly"
-    return TickResult("ledger", True, used(), time.time() - t0, detail, status="ok")
+    try:
+        if due:
+            try:
+                supply = src.token_supply(address, head)
+                held = db.holdings_sum_raw(token_id)
+                if held != supply:
+                    # A source that can only read the LATEST supply may be ahead of the ledger.
+                    # Catch up once before calling it wrong.
+                    head2 = src.latest_block()
+                    if head2 > head:
+                        src.transfer_logs(address, head + 1, head2, on_chunk=on_chunk)
+                        head = head2
+                        held = db.holdings_sum_raw(token_id)
+                        supply = src.token_supply(address, head2)
+            except _Deleted:
+                return TickResult("ledger", False, used(), time.time() - t0,
+                                  "skipped — the token was deleted", status="skipped")
+            except transfers.LedgerSourceError as exc:
+                # The sync itself worked; only the check could not run. Try again next pass --
+                # the ledger stops counting as exact if checks keep failing (db.LEDGER_VERIFIED_S).
+                return TickResult("ledger", True, used(), time.time() - t0,
+                                  detail + f" · supply check deferred ({str(exc)[:120]})",
+                                  status="ok")
+            ok = held == supply
+            db.set_ledger_verified(token_id, ok)
+            if not ok:
+                log.warning("transfer ledger for token %s is off total supply by %d raw units — "
+                            "rebuilding it from the first block", token_id, supply - held)
+                db.reset_ledger(token_id)
+                return TickResult("ledger", False, used(), time.time() - t0,
+                                  "did not reconcile to supply — rebuilding", status="failed")
+            detail += " · reconciles to total supply exactly"
+        return TickResult("ledger", True, used(), time.time() - t0, detail, status="ok")
+    finally:
+        prog.update(running=False, stage="done")
 
 
 # ── tape ──────────────────────────────────────────────────────────────────────

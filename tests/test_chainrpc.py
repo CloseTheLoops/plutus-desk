@@ -48,12 +48,18 @@ class Node:
     """A chain plus one node's view of it."""
 
     def __init__(self, chain, head, *, cap=40, slow_span=5_000, state_window=50, batch_max=60,
-                 fail_first=0, http429=0, down=False):
+                 fail_first=0, http429=0, down=False, retry_after=None,
+                 throttle_span_over=None, throttle_logs_after=None):
         self.chain, self.head = chain, head
         self.cap, self.slow_span, self.state_window, self.batch_max = cap, slow_span, state_window, batch_max
         self.fail_first, self.http429, self.down = fail_first, http429, down
         self.requests: list = []
         self.max_span_asked = 0
+        self.retry_after = retry_after                 # sent with every 429
+        self.throttle_span_over = throttle_span_over   # 429 any getLogs wider than this
+        self.throttle_logs_after = throttle_logs_after  # 429 every getLogs after this many
+        self.getlogs_ok = 0
+        self.getlogs_from: list[int] = []
 
     def answer(self, body):
         if self.down:
@@ -64,6 +70,15 @@ class Node:
         if self.http429 > 0:
             self.http429 -= 1
             return 429, {"error": "slow down"}
+        if isinstance(body, dict) and body.get("method") == "eth_getLogs":
+            q = body["params"][0]
+            span = int(q["toBlock"], 16) - int(q["fromBlock"], 16) + 1
+            if self.throttle_span_over and span > self.throttle_span_over:
+                return 429, {"error": "slow down"}
+            if self.throttle_logs_after is not None and self.getlogs_ok >= self.throttle_logs_after:
+                return 429, {"error": "slow down"}
+            self.getlogs_ok += 1
+            self.getlogs_from.append(int(q["fromBlock"], 16))
         if isinstance(body, list):
             if len(body) > self.batch_max:
                 return 429, {"error": "batch too large"}
@@ -127,9 +142,10 @@ class Chain:
 
 
 class Resp:
-    def __init__(self, code, body):
+    def __init__(self, code, body, headers=None):
         self.status_code, self._b = code, body
         self.ok = code == 200
+        self.headers = headers or {}
 
     def json(self):
         return self._b
@@ -141,8 +157,10 @@ def _install(nodes: dict[str, Node]):
     R._span.clear()
 
     def post(url, json=None, timeout=None):
-        code, body = nodes[url].answer(json)
-        return Resp(code, body)
+        n = nodes[url]
+        code, body = n.answer(json)
+        hdr = {"Retry-After": str(n.retry_after)} if code == 429 and n.retry_after else {}
+        return Resp(code, body, hdr)
     R.requests.post = post
 
 
@@ -460,21 +478,198 @@ def test_a_token_deleted_during_its_backfill_gets_nothing_written():
     tok = "0x" + "7d" * 20
     tid = db.upsert_token("robinhood", tok, symbol="DEL", supply_nominal=1e9)
     T.clear_abort(tid)
-    real = R.transfer_logs
+    real = R._post
+    n = [0]
 
-    def slow_then_deleted(*a):
-        out = real(*a)
-        T.abort(tid)                                   # the operator pressed delete meanwhile
-        return out
-    R.transfer_logs = slow_then_deleted
+    def deleted_midway(ep, method, params):
+        if method == "eth_getLogs":
+            n[0] += 1
+            if n[0] == 2:
+                T.abort(tid)                           # the operator pressed delete meanwhile
+        return real(ep, method, params)
+    R._post = deleted_midway
     try:
         r = T.track_ledger(tid)
     finally:
-        R.transfer_logs = real
+        R._post = real
         _uninstall()
     assert r.status == "skipped", r.detail
     n = db.connect().execute("SELECT COUNT(*) FROM transfers WHERE token_id=?", (tid,)).fetchone()[0]
     assert n == 0 and db.ledger_state(tid) is None, "a deleted token's backfill was written anyway"
+
+
+def test_the_worksheet_lists_every_holder_from_an_exact_ledger():
+    from plutus import onboard
+    ch = Chain()
+    ch.add(10, ZERO, _addr(1), 900 * 10 ** 18)
+    ch.add(11, ZERO, _addr(2), 100 * 10 ** 18)
+    ch.add(12, _addr(1), _addr(3), 50 * 10 ** 18)
+    _install({A_URL: Node(ch, 1000, state_window=10 ** 6)})
+    try:
+        tok = "0x" + "82" * 20
+        tid = db.upsert_token("robinhood", tok, symbol="WS", supply_nominal=1000.0)
+        T.clear_abort(tid)
+        assert T.track_ledger(tid).ok and db.ledger_healthy(tid)
+    finally:
+        _uninstall()
+    ws = {r_["address"]: r_ for r_ in onboard.worksheet(tid)}
+    assert set(ws) == {_addr(1), _addr(2), _addr(3)}, sorted(ws)
+    assert abs(ws[_addr(1)]["tokens"] - 850.0) < 1e-9 and ws[_addr(3)]["seen"] == "ledger"
+
+
+# ── 429s: back off, narrow, keep what is finished, resume ──────────────────────────────
+class _NoSleep:
+    def __enter__(self):
+        self.real = R.time.sleep
+        R.time.sleep = lambda s: None
+        self.paused: list[float] = []
+        self.real_pause = R._pause
+        R._pause = lambda ep, s: (self.paused.append(round(s, 1)), self.real_pause(ep, s))
+        R._backoff.clear()
+        return self
+
+    def __exit__(self, *a):
+        R.time.sleep = self.real
+        R._pause = self.real_pause
+        R._backoff.clear()
+        R._db().execute("DELETE FROM rate_state WHERE k LIKE 'rpc:%'")
+
+
+def test_429s_back_off_exponentially():
+    _install({A_URL: Node(Chain(), 1000, http429=4)})
+    try:
+        with _NoSleep() as ns:
+            assert R.latest_block("robinhood") == 900
+    finally:
+        _uninstall()
+    assert ns.paused[:4] == [2.0, 4.0, 8.0, 16.0], f"back-off was {ns.paused}"
+
+
+def test_retry_after_is_honoured():
+    _install({A_URL: Node(Chain(), 1000, http429=2, retry_after=37)})
+    try:
+        with _NoSleep() as ns:
+            R.latest_block("robinhood")
+    finally:
+        _uninstall()
+    assert ns.paused[:2] == [37.0, 37.0], f"Retry-After ignored: {ns.paused}"
+    assert R._retry_after(Resp(429, {}, {"Retry-After": "Wed, 21 Oct 2015 07:28:00 GMT"})) == 0.0
+    assert R._retry_after(Resp(429, {}, {"Retry-After": "99999"})) == R.RETRY_AFTER_CAP_S
+
+
+def test_throttled_ranges_are_narrowed_and_the_history_completes():
+    ch = _busy_chain()
+    node = Node(ch, 250_000, cap=10 ** 6, slow_span=10 ** 9, throttle_span_over=30_000)
+    _install({A_URL: node})
+    try:
+        with _NoSleep():
+            got = R.transfer_logs("robinhood", TOKEN, 0, 240_000)
+    finally:
+        _uninstall()
+    _check_logs(got, ch, 0, 240_000)
+
+
+def test_a_backfill_cut_off_by_429s_keeps_its_progress_and_resumes_there():
+    """Production: 429s on eth_getLogs abandoned blocks 66.75M-73.2M entirely."""
+    ch = _busy_chain(n_transfers=2000, span=200_000)
+    node = Node(ch, 250_000, cap=10 ** 6, slow_span=10 ** 9, state_window=10 ** 6,
+                throttle_logs_after=6)
+    _install({A_URL: node})
+    old_flush, old_first, old_max = R.FLUSH_LOGS, R.FIRST_SPAN, R.MAX_SPAN
+    R.FLUSH_LOGS, R.FIRST_SPAN, R.MAX_SPAN = 200, 20_000, 20_000      # ~13 ranges; 429s after 6
+    try:
+        tok = "0x" + "7e" * 20
+        tid = db.upsert_token("robinhood", tok, symbol="RL", supply_nominal=1e9)
+        T.clear_abort(tid)
+        with _NoSleep():
+            r = T.track_ledger(tid)
+        assert not r.ok and "progress kept to block" in r.detail, r.detail
+        kept = db.ledger_state(tid)["synced_block"]
+        assert kept > 0, "nothing was kept from a backfill that finished several ranges"
+        assert not db.ledger_healthy(tid), "a half-built ledger was treated as exact"
+        # "restart": in-memory state gone, the node recovers
+        R._span.clear()
+        node.throttle_logs_after = None
+        node.getlogs_from.clear()
+        with _NoSleep():
+            r = T.track_ledger(tid)
+        assert r.ok and "reconciles to total supply exactly" in r.detail, r.detail
+        assert node.getlogs_from[0] == kept + 1, \
+            f"resumed from block {node.getlogs_from[0]}, not {kept + 1}"
+        head = db.ledger_state(tid)["synced_block"]
+        truth = {}
+        for x in ch.logs:
+            if x["b"] <= head:
+                truth[x["f"]] = truth.get(x["f"], 0) - x["v"]
+                truth[x["t"]] = truth.get(x["t"], 0) + x["v"]
+        truth = {a: v for a, v in truth.items() if a != ZERO and v}
+        bal = {r_["address"]: int(r_["raw"]) for r_ in db.connect().execute(
+            "SELECT address, raw FROM holdings WHERE token_id=?", (tid,)) if int(r_["raw"])}
+        assert bal == truth, "the resumed ledger differs from the chain"
+    finally:
+        R.FLUSH_LOGS, R.FIRST_SPAN, R.MAX_SPAN = old_flush, old_first, old_max
+        _uninstall()
+
+
+def test_a_chunk_does_not_mark_the_ledger_fresh_until_it_reaches_the_head():
+    tok = "0x" + "7f" * 20
+    tid = db.upsert_token("robinhood", tok, symbol="CH", supply_nominal=1e9)
+    db.apply_transfers(tid, [], 18, 100, caught_up=False)
+    assert db.ledger_state(tid)["synced_ts"] is None
+    db.apply_transfers(tid, [], 18, 200, caught_up=True)
+    ts = db.ledger_state(tid)["synced_ts"]
+    db.apply_transfers(tid, [], 18, 300, caught_up=False)
+    assert db.ledger_state(tid)["synced_ts"] == ts and db.ledger_state(tid)["synced_block"] == 300
+
+
+def test_ledger_progress_is_visible_while_it_builds():
+    ch = _busy_chain(n_transfers=900)
+    node = Node(ch, 250_000, cap=10 ** 6, slow_span=10 ** 9, state_window=10 ** 6)
+    _install({A_URL: node})
+    old_flush, old_first = R.FLUSH_LOGS, R.FIRST_SPAN
+    R.FLUSH_LOGS, R.FIRST_SPAN = 100, 20_000
+    seen = []
+    real = db.apply_transfers
+
+    def spy(tid_, logs, dec, through, caught_up=True):
+        n = real(tid_, logs, dec, through, caught_up)
+        seen.append(dict(T.ledger_progress[tid_]))
+        return n
+    T.db.apply_transfers = spy
+    try:
+        tok = "0x" + "80" * 20
+        tid = db.upsert_token("robinhood", tok, symbol="PG", supply_nominal=1e9)
+        T.clear_abort(tid)
+        assert T.track_ledger(tid).ok
+    finally:
+        T.db.apply_transfers = real
+        R.FLUSH_LOGS, R.FIRST_SPAN = old_flush, old_first
+        _uninstall()
+    assert len(seen) >= 3, "the backfill was not committed in chunks"
+    assert all(s["running"] and s["backfill"] and s["to"] for s in seen)
+    blocks = [s["block"] for s in seen]
+    assert blocks == sorted(blocks) and seen[-1]["transfers"] > seen[0]["transfers"]
+    assert not T.ledger_progress[tid]["running"], "progress still says running after it finished"
+
+
+def test_one_sync_per_token_a_second_skips_or_waits():
+    import threading
+    tok = "0x" + "81" * 20
+    tid = db.upsert_token("robinhood", tok, symbol="LK", supply_nominal=1e9)
+    lock = T._ledger_locks.setdefault(tid, threading.Lock())
+    lock.acquire()
+    try:
+        r = T.track_ledger(tid)
+        assert r.status == "skipped" and "already running" in r.detail, r.detail
+        done = []
+        th = threading.Thread(target=lambda: done.append(T.track_ledger(tid, wait=True)))
+        th.start()
+        th.join(0.3)
+        assert not done, "wait=True did not wait for the running sync"
+    finally:
+        lock.release()
+    th.join(5)
+    assert done, "wait=True never ran after the other sync finished"
 
 
 if __name__ == "__main__":

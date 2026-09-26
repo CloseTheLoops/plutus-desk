@@ -166,8 +166,9 @@ def test_scan_state_tracks_a_run_from_start_to_finish():
     tid = db.upsert_token("robinhood", "0x" + "a" * 40, symbol="T")
     seen = {}
 
-    def fake(token_id, full=False, window_s=3600, progress=None):
+    def fake(token_id, full=False, window_s=3600, progress=None, **kw):
         seen["running_during"] = app._scan_state[token_id]["running"]
+        seen["background"] = kw.get("background")
         if progress:
             progress(7, 9)
         return T.TickResult("inventory", True, 9, 0.1, "done")
@@ -180,6 +181,7 @@ def test_scan_state_tracks_a_run_from_start_to_finish():
 
     st = app._scan_state[tid]
     assert seen.get("running_during") is True, "state was not marked running during the scan"
+    assert seen.get("background") is False, "the onboarding scan did not ask for the operator tier"
     assert st["running"] is False, "state was left running after the scan finished"
     assert (st["done"], st["of"]) == (7, 9), f"progress was not recorded: {st}"
     assert st["ok"] is True and "finished" in st

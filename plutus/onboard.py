@@ -242,10 +242,16 @@ def worksheet(token_id: int, min_share: float = 0.002) -> list[dict]:
     ev = {r["address"]: (r["evidence"] or "") for r in db.classified(token_id)}
     rows: dict[str, dict] = {}
 
-    for a, (bal, height) in db.latest_balances(token_id).items():
+    # With an exact transfer ledger, EVERY holder's balance is known -- use it. Otherwise the
+    # per-wallet reads, which cover only the wallets that were read.
+    if db.ledger_healthy(token_id):
+        balances, seen = db.holdings(token_id), "ledger"
+    else:
+        balances, seen = db.latest_balances(token_id), "balance"
+    for a, (bal, height) in balances.items():
         if bal > 0:
             rows[a] = {"address": a, "tokens": bal, "height": height,
-                       "class": cls.get(a, "unknown"), "seen": "balance",
+                       "class": cls.get(a, "unknown"), "seen": seen,
                        "evidence": ev.get(a, "")}
     for r in db.census_rows(token_id):
         bal = float(r["balance"] or 0)

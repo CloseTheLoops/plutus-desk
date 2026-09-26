@@ -159,6 +159,112 @@ def test_a_budget_deferral_reports_partial_not_failed():
     importlib.reload(gmgn)
 
 
+def test_the_onboarding_scan_reads_on_the_operator_tier_when_background_is_spent():
+    """Production: with no ledger, onboarding's balance read went out on a background tier whose
+    daily share the previous day had spent -- it read 0 of 476 wallets. Onboarding is something
+    the operator asked for; it must spend the operator's allowance, like a full pull."""
+    from plutus.sources import gmgn
+    from plutus.track import trackers as T
+    tok = _token()
+    tid = db.upsert_token(CHAIN, tok, symbol="OP", supply_nominal=1e9)
+    wallets = ["0x%040x" % (0x9000 + i) for i in range(30)]
+    for w in wallets:
+        db.classify(tid, w, "ours", source="operator")
+    tiers = []
+
+    def balance(c, w, t, fresh=False, background=False):
+        tiers.append(background)
+        if background:
+            raise gmgn.BudgetExceeded("background daily GMGN budget spent")
+        return (5.0, 1)
+    gmgn.token_balance = balance
+    gmgn.balance_cached = lambda c, w, t: False
+    gmgn.budget = lambda background=False, need=1: (
+        {"left": 0, "ok": False, "resumes_at": time.time() + 36000} if background
+        else {"left": 5000, "ok": True, "resumes_at": time.time()})
+    ok = T.TickResult("x", True, 0, 0.0, "ok", status="ok")
+    real_pool, real_census = T.track_pool, T.track_census
+    T.track_pool = lambda *a, **k: ok
+    T.track_census = lambda *a, **k: ok
+    T.clear_abort(tid)
+    try:
+        _run(app._onboard_scan(tid))
+    finally:
+        T.track_pool, T.track_census = real_pool, real_census
+        importlib.reload(gmgn)
+    st = app._scan_state[tid]
+    assert tiers and not any(tiers), f"onboarding read balances on the background tier: {tiers[:5]}"
+    assert (st["done"], st["of"]) == (30, 30), f"read {st['done']}/{st['of']}: {st['detail']}"
+    assert "balances_problem" not in st, st.get("balances_problem")
+
+
+def test_an_onboarding_that_reads_no_balances_says_why():
+    from plutus.sources import gmgn
+    from plutus.track import trackers as T
+    tok = _token()
+    tid = db.upsert_token(CHAIN, tok, symbol="NB", supply_nominal=1e9)
+    for i in range(12):
+        db.classify(tid, "0x%040x" % (0xA000 + i), "ours", source="operator")
+    gmgn.token_balance = lambda *a, **k: (1.0, 1)
+    gmgn.balance_cached = lambda c, w, t: False
+    gmgn.budget = lambda background=False, need=1: {"left": 0, "ok": False,
+                                                    "resumes_at": time.time() + 3600}
+    ok = T.TickResult("x", True, 0, 0.0, "ok", status="ok")
+    real_pool, real_census = T.track_pool, T.track_census
+    T.track_pool = lambda *a, **k: ok
+    T.track_census = lambda *a, **k: ok
+    T.clear_abort(tid)
+    try:
+        _run(app._onboard_scan(tid))
+    finally:
+        T.track_pool, T.track_census = real_pool, real_census
+        importlib.reload(gmgn)
+    st = app._scan_state[tid]
+    assert "0 of 12" in (st.get("balances_problem") or ""),         f"a scan that read nothing did not say so: {st}"
+
+
+def test_a_slow_ledger_does_not_hold_the_worksheet_hostage():
+    """A throttled first ledger build can take many minutes; onboarding reads balances from GMGN
+    meanwhile and lets the ledger finish in its own thread."""
+    from plutus.sources import gmgn, transfers
+    from plutus.track import trackers as T
+    tok = _token()
+    tid = db.upsert_token(CHAIN, tok, symbol="SL", supply_nominal=1e9)
+    for i in range(5):
+        db.classify(tid, "0x%040x" % (0xB000 + i), "ours", source="operator")
+    gmgn.token_balance = lambda *a, **k: (2.0, 1)
+    gmgn.balance_cached = lambda c, w, t: False
+    gmgn.budget = lambda background=False, need=1: {"left": 5000, "ok": True,
+                                                    "resumes_at": time.time()}
+    ok = T.TickResult("x", True, 0, 0.0, "ok", status="ok")
+    finished = []
+
+    def slow_ledger(token_id, wait=False):
+        time.sleep(1.0)
+        finished.append(token_id)
+        return T.TickResult("ledger", True, 1, 1.0, "synced", status="ok")
+    saved = (T.track_pool, T.track_census, T.track_ledger, transfers.available,
+             app.ONBOARD_LEDGER_WAIT_S)
+    T.track_pool = T.track_census = lambda *a, **k: ok
+    T.track_ledger = slow_ledger
+    transfers.available = lambda chain: True
+    app.ONBOARD_LEDGER_WAIT_S = 0.2
+    T.clear_abort(tid)
+    try:
+        t0 = time.time()
+        _run(app._onboard_scan(tid))
+        took = time.time() - t0
+        time.sleep(1.2)                                   # the ledger thread carries on
+    finally:
+        (T.track_pool, T.track_census, T.track_ledger, transfers.available,
+         app.ONBOARD_LEDGER_WAIT_S) = saved
+        importlib.reload(gmgn)
+    st = app._scan_state[tid]
+    assert "still building" in st["ledger"]["detail"], st
+    assert (st["done"], st["of"]) == (5, 5), f"GMGN fallback did not read the wallets: {st}"
+    assert finished == [tid], "the ledger build was abandoned instead of left to finish"
+
+
 def test_the_page_shows_partial_and_deferred_as_such():
     tpl = (pathlib.Path(app.__file__).parent / "templates" / "analysis.html").read_text(
         encoding="utf-8")
