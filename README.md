@@ -194,6 +194,36 @@ single point of failure.
 so the service and any CLI command coordinate automatically — but only if they use the same
 `data/` directory. Two checkouts with separate databases are two independent budgets.
 
+## Exact balances from the transfer ledger (Etherscan)
+
+With an Etherscan API key, Plutus keeps the token's **complete transfer history** (every ERC-20
+`Transfer` event, via `getLogs`) and derives every address's balance from it, exactly, as
+integers. That covers what per-wallet reads miss between reads: transfers between your own
+wallets, staking, other venues, and every holder the GMGN census never ranks. The ledger is
+checked against the token's total supply hourly and rebuilt if it ever disagrees. While it is
+synced (within 15 minutes) and verified, per-wallet GMGN balance reads stop entirely; GMGN is kept
+for what only it has — cost basis, PnL, tags, and pool checks. If the ledger falls behind, the desk
+falls back to GMGN reads on its own.
+
+**Key:** put it on one line in `data/etherscan.key` (gitignored), or set `PLUTUS_ETHERSCAN_KEY`.
+Never commit it or paste it anywhere shared. `python -m plutus.cli doctor <token>` checks the key,
+the chain on your plan, and that the ledger sums to supply — without printing the key.
+
+**Limits** (researched 2026-09-26 — re-verify monthly):
+
+| Plan | Price | Rate | Daily | Robinhood chain |
+|---|---|---|---|---|
+| Free | $0 | 3/s | 100,000 | until 2026-10-15 only |
+| Lite | $49/mo | 5/s | 100,000 | required from 2026-10-16 |
+
+Measured by a simulated week: **~4,300 Etherscan calls a day per token** (a sync every 30s plus
+the hourly supply check), and GMGN falls from ~110 calls an hour to ~1. Settings:
+`PLUTUS_ETHERSCAN_RPS` (default 2.5; raise to 4.5 on Lite), `PLUTUS_ETHERSCAN_DAILY` (default
+90,000). All processes share one pacer through the database.
+
+GeckoTerminal (free trade feed and trusted pool prices, 30 calls/min public) is likewise paced
+across every process through the database, at one call per 2.1s, and a 429 pauses every caller.
+
 ## Staying inside the API budget at scale
 
 GMGN calls are capped per hour (`PLUTUS_MAX_CALLS_HOUR`, default 900). Three things keep a large

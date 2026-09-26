@@ -11,6 +11,9 @@ internet would read as the operator. Once a password is set, loopback earns noth
 """
 from __future__ import annotations
 
+import os as _os_guard
+_os_guard.environ.setdefault("PLUTUS_ETHERSCAN_DISABLE", "1")   # never real Etherscan here
+
 import inspect
 import pathlib
 import sys

@@ -17,6 +17,9 @@ Target: under ~150 GMGN calls an hour in steady state with 458 wallets.
 """
 from __future__ import annotations
 
+import os as _os_guard
+_os_guard.environ.setdefault("PLUTUS_ETHERSCAN_DISABLE", "1")   # never real Etherscan here
+
 import importlib
 import logging
 import math

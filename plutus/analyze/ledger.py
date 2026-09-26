@@ -164,7 +164,20 @@ def build(token_id: int) -> Ledger:
     # cannot contain (db.fills_after has the exact rule). Real reads still happen: on first
     # sight, after a feed gap, and at the hourly reconciliation that catches what fills cannot
     # see (transfers, other venues, staking).
-    rows = db.latest_balance_rows(token_id)
+    # EXACT MODE: with a trusted transfer ledger every balance comes from the token's full
+    # transfer history -- transfers between our wallets, staking and other venues included --
+    # as of the synced block. Fills after that block (seconds' worth) still roll forward.
+    exact = db.ledger_healthy(token_id)
+    if exact:
+        st_l = db.ledger_state(token_id)
+        held_map = db.holdings(token_id)
+        rows = {a: (held_map.get(a, (0.0, None))[0], st_l["synced_block"], st_l["synced_ts"])
+                for group in by_class.values() for a in group}
+        notes.append(f"balances are exact, from the token's full transfer history (block "
+                     f"{st_l['synced_block']:,}, {db.now() - st_l['synced_ts']}s ago), and "
+                     f"reconcile to total supply")
+    else:
+        rows = db.latest_balance_rows(token_id)
     balances = {a: (tok, h) for a, (tok, h, _obs) in rows.items()}
     ours_addrs = by_class.get("ours", [])
     state = {a: (rows[a][1], rows[a][2]) for a in ours_addrs if a in rows}
@@ -175,7 +188,7 @@ def build(token_id: int) -> Ledger:
         if tok + delta < -1e-9:
             negative.append(a)
         balances[a] = (max(0.0, tok + delta), h)
-    if rolled:
+    if rolled and not exact:
         n_fills = sum(n for _d, n in rolled.values())
         notes.append(f"{len(rolled)} of our wallets include {n_fills} fill(s) made since their "
                      f"last balance read, taken from the trade feed")
@@ -184,13 +197,14 @@ def build(token_id: int) -> Ledger:
                      f"tokens moved in from outside the tracked pool; shown as 0 until re-read")
     notes.extend(census_notes(token_id))
     from plutus.track.trackers import RECONCILE_S               # never imports this module
-    overdue = [a for a in ours_addrs if a in rows and db.now() - rows[a][2] > RECONCILE_S + 600]
+    overdue = ([] if exact else
+               [a for a in ours_addrs if a in rows and db.now() - rows[a][2] > RECONCILE_S + 600])
     if overdue:
         notes.append(f"{len(overdue)} of our wallets are past their {RECONCILE_S // 3600}h "
                      f"re-check — the API budget has been in use elsewhere. Their positions "
                      f"include every trade since, but not transfers or staking; a full pull "
                      f"re-reads them now.")
-    moved = db.drift_since(token_id, db.now() - 86400)
+    moved = [] if exact else db.drift_since(token_id, db.now() - 86400)
     if moved:
         caught = max(r["ts"] for r in moved)
         behind = [a for a in ours_addrs if a in rows and rows[a][2] < caught]
@@ -200,7 +214,7 @@ def build(token_id: int) -> Ledger:
                          f"{sum(r['delta'] or 0 for r in moved):+,.0f}. {len(behind)} of our "
                          f"wallets were read before that and are being re-checked within "
                          f"~2h — until then our position may be off. A full pull corrects it now.")
-    gap_ts = db.latest_tape_gap_ts(token_id)
+    gap_ts = None if exact else db.latest_tape_gap_ts(token_id)
     if gap_ts:
         behind = [a for a in ours_addrs if a in rows and rows[a][2] < gap_ts]
         if behind:
@@ -241,12 +255,12 @@ def build(token_id: int) -> Ledger:
                          f"observation yet — our position is UNDERSTATED by whatever they hold")
 
     census_ts = db.latest_census_ts(token_id)
-    holders = 0
-    if census_ts:
-        known = set().union(*(set(v) for v in by_class.values())) if by_class else set()
-        holders = sum(1 for r in db.census_rows(token_id, census_ts)
-                      if (r["balance"] or 0) > 0 and r["address"] not in known
-                      and (r["addr_type"] or 0) != 2)
+    # Third-party holders: every one from the transfer ledger when there is one, else the census.
+    known = set().union(*(set(v) for v in by_class.values())) if by_class else set()
+    holder_list, _complete = db.holder_rows(token_id)
+    holders = sum(1 for r in holder_list
+                  if (r["balance"] or 0) > 0 and r["address"] not in known
+                  and (r["addr_type"] or 0) != 2)
 
     balance_ts = None
     row = db.connect().execute("SELECT MAX(observed_ts) t FROM balances WHERE token_id=?",
@@ -276,6 +290,12 @@ def census_notes(token_id: int) -> list[str]:
     """
     from plutus.track.trackers import CENSUS_SLICES          # trackers never imports this module
     m = db.latest_census_meta(token_id)
+    if db.ledger_healthy(token_id):
+        # The ledger holds every holder; the census only adds tags and cost basis. A thin census
+        # no longer makes anything partial, so it is reported, not warned about.
+        n = len(db.holdings(token_id))
+        age = f", tags {max(0, (db.now() - m['sweep_ts']) // 3600)}h old" if m else ", no tags yet"
+        return [f"holders: all {n} from the transfer ledger{age}"]
     if m is None:
         return ["CENSUS PARTIAL: no holder census yet — holder-based figures are not available"]
     age_m = max(0, (db.now() - m["sweep_ts"]) // 60)

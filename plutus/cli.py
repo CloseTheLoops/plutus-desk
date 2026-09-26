@@ -183,6 +183,8 @@ def cmd_doctor(a) -> None:
         print(f"  {'PASS' if ok else 'FAIL'}  {label}" + (f"  —  {detail}" if detail else ""))
         return ok
 
+    _doctor_etherscan(a, line)
+
     print()
     print("gmgn credentials")
     home = gmgn.ANALYTICS_HOME
@@ -281,6 +283,63 @@ def cmd_doctor(a) -> None:
     else:
         line(True, "database agrees", f"stored {stored:,.4f}")
     print()
+
+
+def _doctor_etherscan(a, line) -> None:
+    """The transfer ledger's source: key, chain on this plan, and -- per token -- exactness.
+
+    Four calls at most. Never prints the key itself, only where it was found.
+    """
+    import os
+
+    from plutus.sources import etherscan as es
+
+    print()
+    print("etherscan (transfer ledger)")
+    key = es.api_key()
+    where = next((n for n in ("PLUTUS_ETHERSCAN_KEY", "ETHERSCAN_API_KEY")
+                  if (os.environ.get(n) or "").strip()), "data/etherscan.key")
+    if not key:
+        line(False, "api key", "none — balances fall back to per-wallet GMGN reads. Put the key "
+             "on one line in data/etherscan.key (gitignored) or set PLUTUS_ETHERSCAN_KEY")
+        return
+    line(True, "api key", f"from {where} ({len(key)} chars)")
+    cid = config.chain(a.chain).etherscan_chain
+    if cid is None:
+        line(False, "chain supported", f"{a.chain} has no Etherscan chain id in config")
+        return
+    try:
+        head = es.latest_block(cid)
+        line(True, "chain on this plan", f"{a.chain} (chainid {cid}) head block {head:,}")
+    except es.PlanRequired as exc:
+        line(False, "chain on this plan", str(exc)[:200])
+        return
+    except es.EtherscanError as exc:
+        line(False, "chain on this plan", str(exc)[:160])
+        return
+    b = es.budget()
+    if b.get("day") is not None:
+        line(b["day"] < b["day_cap"], "daily budget", f"{b['day']:,}/{b['day_cap']:,} today "
+             f"· paced at {es.RPS}/s")
+    if not a.token:
+        return
+    try:
+        tid, cfg = _token_id(a.token)
+    except SystemExit:
+        return
+    st = db.ledger_state(tid)
+    if not st:
+        line(False, "ledger built", "not yet — the server builds it on its next pass, or run "
+             f"a full pull for {a.token}")
+        return
+    supply = es.token_supply(cid, cfg.address)
+    held = db.holdings_sum_raw(tid)
+    line(held == supply, "ledger sums to supply",
+         f"{len(db.holdings(tid)):,} holders · synced to block {st['synced_block']:,}"
+         + ("" if held == supply else f" · off by {supply - held} raw units (rebuild due)"))
+    line(db.ledger_healthy(tid), "exact mode",
+         "on — balances are exact" if db.ledger_healthy(tid) else
+         "off — not synced in the last 15 min or not yet verified; GMGN reads cover meanwhile")
 
 
 def main() -> None:

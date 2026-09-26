@@ -65,7 +65,9 @@ class HolderView:
     notes: list[str] = field(default_factory=list)
 
 
-def _segment(avg_cost: float, spot: float) -> str:
+def _segment(avg_cost: float | None, spot: float) -> str:
+    if avg_cost is None:
+        return "cost unknown"
     if avg_cost <= 0:
         return "never bought"
     r = spot / avg_cost
@@ -81,12 +83,16 @@ def build(token_id: int, spot: float, float_true: float,
     v = HolderView(float_true=float_true, spot=spot, supply=supply)
     sweep = db.latest_census_ts(token_id)
     v.sweep_ts = sweep
-    if not sweep:
+    all_rows, complete = db.holder_rows(token_id)
+    if not all_rows:
         v.notes.append("no census yet — run the census tracker")
         return v
+    if complete:
+        v.notes.append("every holder, from the token's full transfer history; cost basis, PnL "
+                       "and tags from the GMGN census where it covers them")
 
     known = set(db.class_map(token_id))
-    rows = [r for r in db.census_rows(token_id, sweep)
+    rows = [r for r in all_rows
             if r["address"] not in known and (r["addr_type"] or 0) != 2]
     holding = [r for r in rows if (r["balance"] or 0) > 0]
     v.exited = len(rows) - len(holding)
@@ -110,7 +116,7 @@ def build(token_id: int, spot: float, float_true: float,
     out: list[Holder] = []
     for r in sorted(holding, key=lambda x: -(x["balance"] or 0)):
         bal = float(r["balance"] or 0)
-        ac = float(r["avg_cost"] or 0)
+        ac = None if r["avg_cost"] is None else float(r["avg_cost"])
         t0 = int(r["start_holding_at"] or 0)
         la = int(r["last_active"] or 0)
         a = act.get(r["address"], {})
@@ -120,7 +126,7 @@ def build(token_id: int, spot: float, float_true: float,
             share_supply=bal / supply if supply else 0.0,
             usd=bal * spot,
             avg_cost=ac or None,
-            vs_cost=(spot / ac) if ac > 0 else None,
+            vs_cost=(spot / ac) if ac and ac > 0 else None,
             segment=_segment(ac, spot),
             entered_ts=t0, held_days=((now - t0) / DAY) if t0 else None,
             last_active_ts=la, dormant_days=((now - la) / DAY) if la else None,

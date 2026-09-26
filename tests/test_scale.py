@@ -8,6 +8,9 @@ off stale reserves. These tests pin each fix, then run the scenario and count th
 """
 from __future__ import annotations
 
+import os as _os_guard
+_os_guard.environ.setdefault("PLUTUS_ETHERSCAN_DISABLE", "1")   # never real Etherscan here
+
 import importlib
 import pathlib
 import sys

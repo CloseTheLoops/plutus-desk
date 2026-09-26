@@ -156,6 +156,26 @@ CREATE TABLE IF NOT EXISTS drift (
   PRIMARY KEY (token_id, ts, address)
 );
 
+-- THE TRANSFER LEDGER. Every Transfer of the token, from its first block. Holdings are derived
+-- from it EXACTLY -- raw integer units as text, never floats -- so they can be checked against
+-- total supply to the last unit. When a token has a ledger, it is the source of truth for every
+-- balance: ours, the pool, staking, and every holder the vendor's ranked slices never showed.
+CREATE TABLE IF NOT EXISTS transfers (
+  token_id INTEGER NOT NULL, block INTEGER NOT NULL, log_index INTEGER NOT NULL,
+  tx_hash TEXT NOT NULL, from_addr TEXT NOT NULL, to_addr TEXT NOT NULL, raw TEXT NOT NULL,
+  ts INTEGER,
+  PRIMARY KEY (token_id, tx_hash, log_index)
+);
+CREATE INDEX IF NOT EXISTS ix_transfers_block ON transfers(token_id, block);
+CREATE TABLE IF NOT EXISTS holdings (
+  token_id INTEGER NOT NULL, address TEXT NOT NULL, raw TEXT NOT NULL, changed_block INTEGER,
+  PRIMARY KEY (token_id, address)
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS ledger_state (
+  token_id INTEGER PRIMARY KEY, synced_block INTEGER NOT NULL, decimals INTEGER NOT NULL,
+  synced_ts INTEGER, verified_ts INTEGER, verified_ok INTEGER
+);
+
 CREATE TABLE IF NOT EXISTS tape_gaps (
   token_id INTEGER NOT NULL, ts INTEGER NOT NULL,
   after_block INTEGER, before_block INTEGER,
@@ -298,7 +318,7 @@ def record_trades(rows: list[tuple]) -> int:
 # operator believes finished, which is the worst possible outcome for a delete button.
 TOKEN_KEYED = ("venues", "addresses", "calibration", "pool_obs", "trades", "balances",
                "census", "census_meta", "ticks", "campaigns", "pool_parity", "tape_gaps",
-               "scan_lock", "full_requests", "drift")
+               "scan_lock", "full_requests", "drift", "transfers", "holdings", "ledger_state")
 
 
 def delete_token(token_id: int) -> dict:
@@ -574,6 +594,147 @@ def prune(token_id: int) -> dict[str, int]:
 def _has_table(c: sqlite3.Connection, name: str) -> bool:
     return c.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
                      (name,)).fetchone() is not None
+
+
+# ── the transfer ledger ─────────────────────────────────────────────────────────
+ZERO = "0x" + "0" * 40
+
+
+def ledger_state(token_id: int) -> sqlite3.Row | None:
+    return connect().execute("SELECT * FROM ledger_state WHERE token_id=?", (token_id,)).fetchone()
+
+
+def apply_transfers(token_id: int, logs: list[dict], decimals: int, synced_block: int) -> int:
+    """Insert new transfers and apply ONLY the new ones to holdings, exactly. Returns how many.
+
+    Idempotent: a transfer already stored is never applied twice, so overlapping fetches (the
+    block-paged sync re-reads a boundary block on purpose) cannot double-count.
+    """
+    c = connect()
+    new = 0
+    deltas: dict[str, int] = {}
+    last_block: dict[str, int] = {}
+    for t in logs:
+        cur = c.execute("INSERT OR IGNORE INTO transfers VALUES (?,?,?,?,?,?,?,?)",
+                        (token_id, t["block"], t["log_index"], t["tx_hash"], t["from"], t["to"],
+                         str(t["raw"]), t.get("ts")))
+        if cur.rowcount != 1:
+            continue
+        new += 1
+        v = int(t["raw"])
+        if t["from"] != ZERO:                       # a mint has no sender to debit
+            deltas[t["from"]] = deltas.get(t["from"], 0) - v
+            last_block[t["from"]] = t["block"]
+        if t["to"] != ZERO:                         # a burn to the zero address leaves supply
+            deltas[t["to"]] = deltas.get(t["to"], 0) + v
+            last_block[t["to"]] = t["block"]
+    for a, d in deltas.items():
+        row = c.execute("SELECT raw FROM holdings WHERE token_id=? AND address=?",
+                        (token_id, a)).fetchone()
+        bal = (int(row["raw"]) if row else 0) + d
+        c.execute("INSERT OR REPLACE INTO holdings VALUES (?,?,?,?)",
+                  (token_id, a, str(bal), last_block[a]))
+    c.execute("INSERT INTO ledger_state (token_id, synced_block, decimals, synced_ts) "
+              "VALUES (?,?,?,?) ON CONFLICT(token_id) DO UPDATE SET "
+              "synced_block=excluded.synced_block, decimals=excluded.decimals, "
+              "synced_ts=excluded.synced_ts", (token_id, synced_block, decimals, now()))
+    c.commit()
+    return new
+
+
+# The ledger is TRUSTED only while it is recent and its last check against total supply passed.
+# Otherwise the desk falls back to per-wallet reads, so an Etherscan outage or a lapsed plan
+# degrades accuracy instead of freezing the numbers.
+LEDGER_FRESH_S = 900
+
+
+def ledger_healthy(token_id: int) -> bool:
+    st = ledger_state(token_id)
+    return bool(st and st["verified_ok"] == 1 and st["synced_ts"]
+                and now() - st["synced_ts"] <= LEDGER_FRESH_S)
+
+
+def set_ledger_verified(token_id: int, ok: bool) -> None:
+    connect().execute("UPDATE ledger_state SET verified_ts=?, verified_ok=? WHERE token_id=?",
+                      (now(), int(ok), token_id))
+    connect().commit()
+
+
+def reset_ledger(token_id: int) -> None:
+    c = connect()
+    for t in ("transfers", "holdings", "ledger_state"):
+        c.execute(f"DELETE FROM {t} WHERE token_id=?", (token_id,))
+    c.commit()
+
+
+def holdings_sum_raw(token_id: int) -> int:
+    return sum(int(r["raw"]) for r in connect().execute(
+        "SELECT raw FROM holdings WHERE token_id=?", (token_id,)).fetchall())
+
+
+def holdings(token_id: int) -> dict[str, tuple[float, int | None]]:
+    """address -> (tokens, block it last changed). Only addresses holding something."""
+    st = ledger_state(token_id)
+    scale = 10 ** (st["decimals"] if st else 18)
+    return {r["address"]: (int(r["raw"]) / scale, r["changed_block"])
+            for r in connect().execute("SELECT address, raw, changed_block FROM holdings "
+                                       "WHERE token_id=? AND raw<>'0'", (token_id,)).fetchall()}
+
+
+def holder_rows(token_id: int) -> tuple[list[dict], bool]:
+    """Every holder, as census-shaped rows, and whether the list is COMPLETE.
+
+    With a trusted transfer ledger the holder list and every balance come from it -- all of them,
+    exactly -- and the GMGN census only ENRICHES the rows it happens to cover with what only it
+    has: average cost, PnL, tags. What the ledger knows by itself is filled in for everyone:
+    when the holder first received tokens, when they last moved, whether tokens arrived by plain
+    transfer, and whether they ever bought from the pool at all -- which is what "never bought"
+    means, now exact instead of inferred from a missing cost.
+
+    Without a ledger this is the latest census alone, which covers the ranked slices only.
+    """
+    sweep = latest_census_ts(token_id)
+    census = {r["address"]: dict(r) for r in census_rows(token_id, sweep)} if sweep else {}
+    if not ledger_healthy(token_id):
+        return list(census.values()), False
+    c = connect()
+    pools = {a for a, k in class_map(token_id).items() if k == "pool"} | {ZERO}
+    first_in, last_seen, bought, via_transfer = {}, {}, set(), set()
+    for r in c.execute("SELECT to_addr a, from_addr f, MIN(ts) t0, MAX(ts) t1 FROM transfers "
+                       "WHERE token_id=? GROUP BY to_addr, from_addr", (token_id,)).fetchall():
+        a = r["a"]
+        first_in[a] = min(first_in.get(a, r["t0"]), r["t0"])
+        last_seen[a] = max(last_seen.get(a, r["t1"]), r["t1"])
+        (bought if r["f"] in pools else via_transfer).add(a)
+    for r in c.execute("SELECT from_addr a, MAX(ts) t1 FROM transfers WHERE token_id=? "
+                       "GROUP BY from_addr", (token_id,)).fetchall():
+        last_seen[r["a"]] = max(last_seen.get(r["a"], r["t1"]), r["t1"])
+    # A cost basis from our own tape for holders the census never covered.
+    tape_cost = {r["maker"]: r["usd"] / r["tok"] for r in c.execute(
+        "SELECT maker, SUM(usd) usd, SUM(tokens) tok FROM trades WHERE token_id=? AND "
+        "side='buy' AND tokens>0 GROUP BY maker", (token_id,)).fetchall() if r["tok"]}
+    rows = []
+    for a, (tok, _blk) in holdings(token_id).items():
+        cen = census.get(a, {})
+        if a not in bought:
+            cost = 0.0                                  # EXACT: never received from a pool
+        elif cen.get("avg_cost"):
+            cost = cen["avg_cost"]
+        else:
+            cost = tape_cost.get(a)                     # None = bought, but cost unknown
+        rows.append({
+            "address": a, "balance": tok, "avg_cost": cost,
+            "start_holding_at": cen.get("start_holding_at") or first_in.get(a),
+            "last_active": cen.get("last_active") or last_seen.get(a),
+            "realized_profit": cen.get("realized_profit") or 0.0,
+            "unrealized_profit": cen.get("unrealized_profit") or 0.0,
+            "tags": cen.get("tags") or "", "is_suspicious": cen.get("is_suspicious") or 0,
+            "is_new": cen.get("is_new") or 0,
+            "transfer_in": cen.get("transfer_in") or int(a in via_transfer),
+            "addr_type": cen.get("addr_type") or 0,
+            "amount_pct": cen.get("amount_pct"), "usd_value": cen.get("usd_value"),
+        })
+    return rows, True
 
 
 def record_full_request(token_id: int) -> None:

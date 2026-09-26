@@ -16,6 +16,9 @@ and threads run inline, so a week takes about a minute and every run is identica
 """
 from __future__ import annotations
 
+import os as _os_guard
+_os_guard.environ.setdefault("PLUTUS_ETHERSCAN_DISABLE", "1")   # never real Etherscan here
+
 import asyncio
 import importlib
 import logging
@@ -54,6 +57,8 @@ TOKEN = "0x" + "7" * 40
 POOL = "0x8366a39cc670b4001a1121b8f6a443a643e40951"
 STAKE = "0x" + "5" * 40
 DEAD = "0x000000000000000000000000000000000000dead"
+ZERO_ADDR = "0x" + "0" * 40
+FEE_SINK = "0x" + "fe" * 20
 PID = "0x" + "e" * 64
 SUPPLY = 1_000_000_000.0
 FEE = 0.04
@@ -93,6 +98,13 @@ class World:
             self.bal[w] = rest * x / sum(weights)
         for a in self.bal:
             self.changed[a] = self.block() - 1000
+        # Every balance change as the chain records it: a Transfer event. Minted at launch; every
+        # buy, sell, transfer and stake after. Amounts are raw integers so the log conserves
+        # supply exactly, as a real token's does.
+        self.xfers: list[dict] = []
+        self.minted_raw = 0
+        for a, v in list(self.bal.items()):
+            self._xfer(ZERO_ADDR, a, v, block=self.block() - 1000)
         self.rate_limited_until = 0.0
         self.rate_limit_p = 0.0
         self.errors_p = 0.002
@@ -100,6 +112,14 @@ class World:
 
     def block(self) -> int:
         return 70_000_000 + int(CLOCK[0] - T0)
+
+    def _xfer(self, frm, to, amount, block=None):
+        raw = int(round(amount * 10 ** 18))
+        if frm == ZERO_ADDR:
+            self.minted_raw += raw
+        self.xfers.append({"block": block if block is not None else self.block(),
+                           "log_index": len(self.xfers), "tx_hash": f"0x{len(self.xfers):064x}",
+                           "from": frm, "to": to, "raw": raw, "ts": int(CLOCK[0])})
 
     def _touch(self, *addrs):
         b = self.block()
@@ -121,6 +141,7 @@ class World:
         self.bal[POOL] = self.R
         self.bal[maker] = self.bal.get(maker, 0.0) + out
         self._touch(POOL, maker)
+        self._xfer(POOL, maker, out)
         self._tape(maker, "buy", usd, out)
 
     def sell(self, maker, tokens):
@@ -133,7 +154,11 @@ class World:
         self.R, self.Q = r, self.Q - usd
         self.bal[POOL] = self.R
         self.bal[maker] -= tokens
-        self._touch(POOL, maker)
+        # The fee is taken in tokens and goes somewhere -- supply is conserved, as on chain.
+        self.bal[FEE_SINK] = self.bal.get(FEE_SINK, 0.0) + tokens * FEE
+        self._touch(POOL, maker, FEE_SINK)
+        self._xfer(maker, POOL, tokens * (1 - FEE))
+        self._xfer(maker, FEE_SINK, tokens * FEE)
         self._tape(maker, "sell", usd, tokens)
 
     def transfer(self, a, b, amount):
@@ -142,6 +167,7 @@ class World:
         self.bal[a] -= amount
         self.bal[b] = self.bal.get(b, 0.0) + amount
         self._touch(a, b)
+        self._xfer(a, b, amount)
 
     def true_ours(self) -> float:
         return sum(self.bal[w] for w in self.ours)
@@ -161,7 +187,7 @@ class World:
             return {"holder_count": sum(1 for v in self.bal.values() if v > 0), "symbol": "SIM"}
         if cmd == ("token", "traders"):
             holders = [(a, v) for a, v in self.bal.items()
-                       if v > 0 and a not in (POOL, self.stake, DEAD)]
+                       if v > 0 and a not in (POOL, self.stake, DEAD, FEE_SINK)]
             ob, tag = flags.get("--order-by"), flags.get("--tag")
             if ob == "amount_percentage":
                 holders.sort(key=lambda x: -x[1])
@@ -176,6 +202,10 @@ class World:
 
     def gecko_trades(self):
         return list(reversed(self.trades[-gecko.TRADES_WINDOW:]))
+
+    # ── what Etherscan answers ─────────────────────────────────────────────────────────
+    def etherscan_logs(self, from_block, to_block):
+        return [dict(x) for x in self.xfers if from_block <= x["block"] <= to_block]
 
     def gecko_pool(self):
         return {"base_reserve": self.R, "quote_reserve": self.Q, "spot": self.Q / self.R,

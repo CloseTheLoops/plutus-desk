@@ -15,6 +15,8 @@ Free tier is ~30 req/min, so the module self-throttles and backs off on 429.
 """
 from __future__ import annotations
 
+import sqlite3
+import threading
 import time
 from typing import Any
 
@@ -25,18 +27,68 @@ from plutus import config
 log = config.get_logger("gecko")
 
 BASE = "https://api.geckoterminal.com/api/v2"
+# The public API allows 30 calls a minute (researched 2026-09-26). 2.1s keeps every process on
+# this machine together at ~28/minute -- shared through the database, like the GMGN and Etherscan
+# pacers, because the server and a CLI command would otherwise each spend the full allowance.
 MIN_INTERVAL_S = 2.1
 _last = 0.0
+_conn: sqlite3.Connection | None = None
+_conn_lock = threading.Lock()
+_local = threading.Lock()
+
+
+def _db() -> sqlite3.Connection:
+    global _conn
+    with _conn_lock:
+        if _conn is None:
+            c = sqlite3.connect(str(config.DB_PATH), timeout=10, check_same_thread=False,
+                                isolation_level=None)
+            c.execute("PRAGMA journal_mode=WAL")
+            c.execute("PRAGMA busy_timeout=10000")
+            c.execute("CREATE TABLE IF NOT EXISTS rate_state (k TEXT PRIMARY KEY, next_free REAL NOT NULL)")
+            _conn = c
+        return _conn
+
+
+def _pace() -> None:
+    """Reserve the next slot for EVERY process; sleep outside the transaction."""
+    global _last
+    with _local:
+        try:
+            c = _db()
+            c.execute("BEGIN IMMEDIATE")
+            now = time.time()
+            row = c.execute("SELECT next_free FROM rate_state WHERE k='gecko'").fetchone()
+            nxt = float(row[0]) if row else 0.0
+            if nxt > now + 120:
+                nxt = now
+            start = max(now, nxt)
+            c.execute("INSERT INTO rate_state (k, next_free) VALUES ('gecko', ?) "
+                      "ON CONFLICT(k) DO UPDATE SET next_free=excluded.next_free",
+                      (start + MIN_INTERVAL_S,))
+            c.execute("COMMIT")
+            wait = start - time.time()
+        except sqlite3.Error:
+            wait = MIN_INTERVAL_S - (time.time() - _last)
+            _last = time.time() + max(0.0, wait)
+    if wait > 0:
+        time.sleep(wait)
+
+
+def _pause(seconds: float) -> None:
+    """A 429 is about the whole allowance: hold every caller, not just this thread."""
+    try:
+        _db().execute("INSERT INTO rate_state (k, next_free) VALUES ('gecko', ?) ON CONFLICT(k) "
+                      "DO UPDATE SET next_free=MAX(next_free, excluded.next_free)",
+                      (time.time() + seconds,))
+    except sqlite3.Error:
+        pass
 
 
 def _get(path: str, params: dict | None = None, quick: bool = False) -> dict | None:
     """quick=True: one attempt, no backoff sleep — for paths that must not block a loop."""
-    global _last
     for attempt in range(3):
-        wait = MIN_INTERVAL_S - (time.time() - _last)
-        if wait > 0:
-            time.sleep(wait)
-        _last = time.time()
+        _pace()
         try:
             r = requests.get(BASE + path, params=params or {}, timeout=20,
                              headers={"Accept": "application/json", "User-Agent": "plutus"})
@@ -46,9 +98,9 @@ def _get(path: str, params: dict | None = None, quick: bool = False) -> dict | N
         if r.status_code == 404:
             return None                     # a real answer: unknown token/pool
         if r.status_code == 429:
+            _pause(10 * (attempt + 1))
             if quick:
                 return None
-            time.sleep(10 * (attempt + 1))
             continue
         if r.ok:
             return r.json()

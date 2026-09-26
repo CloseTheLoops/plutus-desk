@@ -12,6 +12,9 @@ THE THREE FAILURES THIS PINS DOWN, all observed in a live session:
 """
 from __future__ import annotations
 
+import os as _os_guard
+_os_guard.environ.setdefault("PLUTUS_ETHERSCAN_DISABLE", "1")   # never real Etherscan here
+
 import asyncio
 import pathlib
 import sys

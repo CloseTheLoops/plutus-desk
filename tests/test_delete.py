@@ -8,6 +8,9 @@ row gone, no token-keyed table unaccounted for, and the symbol not recoverable f
 """
 from __future__ import annotations
 
+import os as _os_guard
+_os_guard.environ.setdefault("PLUTUS_ETHERSCAN_DISABLE", "1")   # never real Etherscan here
+
 import pathlib
 import sys
 import tempfile

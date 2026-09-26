@@ -13,6 +13,9 @@ never hold SQLite's write lock while it sleeps, or every unrelated write queues 
 """
 from __future__ import annotations
 
+import os as _os_guard
+_os_guard.environ.setdefault("PLUTUS_ETHERSCAN_DISABLE", "1")   # never real Etherscan here
+
 import pathlib
 import json
 import subprocess

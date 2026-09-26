@@ -47,12 +47,13 @@ def build(token_id: int, spot: float, float_true: float = 0.0) -> Composition:
     exactly the supply we cannot see."""
     sweep = db.latest_census_ts(token_id)
     c = Composition(sweep_ts=sweep, float_true=float_true)
-    if not sweep:
+    all_rows, complete = db.holder_rows(token_id)
+    if not all_rows:
         c.notes.append("no census yet — run the census tracker")
         return c
 
     known = set(db.class_map(token_id))
-    rows = [r for r in db.census_rows(token_id, sweep)
+    rows = [r for r in all_rows
             if r["address"] not in known and (r["addr_type"] or 0) != 2]
     holding = [r for r in rows if (r["balance"] or 0) > 0]
     c.exited = len(rows) - len(holding)
@@ -77,8 +78,12 @@ def build(token_id: int, spot: float, float_true: float = 0.0) -> Composition:
         tok = sum(r["balance"] or 0 for r in sel)
         c.segments.append(Segment(name, len(sel), tok, tok / c.float_true, note))
 
-    seg("never bought", lambda r: (r["avg_cost"] or 0) <= 0,
-        "no cost basis, no break-even to wait for — the softest supply")
+    # avg_cost None means "bought, cost unknown" -- NOT never bought. Treating the two alike
+    # filed every holder the census had not priced as the softest supply there is.
+    seg("never bought", lambda r: r["avg_cost"] is not None and r["avg_cost"] <= 0,
+        "arrived by transfer, never bought from the pool: no break-even to wait for")
+    seg("cost unknown", lambda r: r["avg_cost"] is None,
+        "bought from the pool, but no cost basis is known for them yet")
     seg("deep underwater", lambda r: 0 < (r["avg_cost"] or 0) and spot / r["avg_cost"] < 0.5,
         "below half their cost")
     seg("mild underwater", lambda r: 0 < (r["avg_cost"] or 0) and 0.5 <= spot / r["avg_cost"] < 1,

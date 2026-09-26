@@ -13,6 +13,9 @@ Both are asserted here without touching the network.
 """
 from __future__ import annotations
 
+import os as _os_guard
+_os_guard.environ.setdefault("PLUTUS_ETHERSCAN_DISABLE", "1")   # never real Etherscan here
+
 import pathlib
 import sys
 import threading

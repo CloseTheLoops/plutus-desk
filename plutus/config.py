@@ -52,13 +52,15 @@ class ChainProfile:
     addr_lower: bool          # EVM: normalize to lowercase. Solana: never.
     native_symbol: str
     verified: bool            # have we actually run the full pipeline here?
+    etherscan_chain: int | None = None   # Etherscan v2 chain id; None = no transfer ledger
 
 
 CHAINS: dict[str, ChainProfile] = {
-    "robinhood": ChainProfile("robinhood", "robinhood", True, "ETH", verified=True),
-    "bsc": ChainProfile("bsc", "bsc", True, "BNB", verified=False),
-    "base": ChainProfile("base", "base", True, "ETH", verified=False),
-    "eth": ChainProfile("eth", "eth", True, "ETH", verified=False),
+    "robinhood": ChainProfile("robinhood", "robinhood", True, "ETH", verified=True,
+                              etherscan_chain=4663),
+    "bsc": ChainProfile("bsc", "bsc", True, "BNB", verified=False, etherscan_chain=56),
+    "base": ChainProfile("base", "base", True, "ETH", verified=False, etherscan_chain=8453),
+    "eth": ChainProfile("eth", "eth", True, "ETH", verified=False, etherscan_chain=1),
     "sol": ChainProfile("sol", "solana", False, "SOL", verified=False),
 }
 

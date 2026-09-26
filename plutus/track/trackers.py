@@ -24,7 +24,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
 from plutus import config, db
-from plutus.sources import gecko, gmgn
+from plutus.sources import etherscan, gecko, gmgn
 
 log = config.get_logger("track")
 
@@ -117,6 +117,72 @@ def track_pool(token_id: int, verify: bool = False, background: bool = False) ->
                    liq, source)
     return TickResult("pool", True, calls, time.time() - t0,
                       f"R {base:,.0f} Q {quote:,.2f} spot {quote/base:.6e} via {source}" + note)
+
+
+# ── the transfer ledger ──────────────────────────────────────────────────────────
+# How often the ledger is re-checked against total supply. One call; a mismatch rebuilds it.
+LEDGER_VERIFY_S = 3600
+
+
+def track_ledger(token_id: int) -> TickResult:
+    """Bring the transfer ledger up to the chain head, and check it against total supply.
+
+    The first run backfills from the token's first block; every run after fetches only blocks
+    since the last. Balances derived from it are exact, so the hourly check is exact too: the
+    holdings must sum to total supply to the last unit, or the ledger is rebuilt rather than
+    trusted.
+    """
+    if aborted(token_id):
+        return TickResult("ledger", False, 0, 0.0, "skipped — the token was deleted",
+                          status="skipped")
+    t0 = time.time()
+    chain, address, _ = _ctx(token_id)
+    cid = config.chain(chain).etherscan_chain
+    if cid is None or not etherscan.api_key():
+        return TickResult("ledger", False, 0, 0.0, "no Etherscan key, or chain not on Etherscan",
+                          status="skipped")
+    before = etherscan.budget().get("day") or 0
+    try:
+        st = db.ledger_state(token_id)
+        dec = st["decimals"] if st else etherscan.decimals(cid, address)
+        start = st["synced_block"] + 1 if st else 0
+        head = etherscan.latest_block(cid)
+        new = 0
+        if head >= start:
+            new = db.apply_transfers(token_id, etherscan.transfer_logs(cid, address, start, head),
+                                     dec, head)
+        detail = f"synced to block {head:,} · {new} new transfer(s)"
+        st = db.ledger_state(token_id)
+        due = (st is not None and (not st["verified_ts"] or st["verified_ok"] != 1
+               or db.now() - st["verified_ts"] >= LEDGER_VERIFY_S))
+        if due:
+            supply = etherscan.token_supply(cid, address)
+            held = db.holdings_sum_raw(token_id)
+            if held != supply:
+                # The head can move between the two reads. Catch up once before calling it wrong.
+                head2 = etherscan.latest_block(cid)
+                if head2 > head:
+                    new += db.apply_transfers(
+                        token_id, etherscan.transfer_logs(cid, address, head + 1, head2), dec, head2)
+                    held = db.holdings_sum_raw(token_id)
+                    supply = etherscan.token_supply(cid, address)
+            ok = held == supply
+            db.set_ledger_verified(token_id, ok)
+            if not ok:
+                log.warning("transfer ledger for token %s is off total supply by %d raw units — "
+                            "rebuilding it from the first block", token_id, supply - held)
+                db.reset_ledger(token_id)
+                return TickResult("ledger", False, (etherscan.budget().get("day") or 0) - before,
+                                  time.time() - t0, "did not reconcile to supply — rebuilding",
+                                  status="failed")
+            detail += " · reconciles to total supply exactly"
+        return TickResult("ledger", True, (etherscan.budget().get("day") or 0) - before,
+                          time.time() - t0, detail, status="ok")
+    except etherscan.NoKey as exc:
+        return TickResult("ledger", False, 0, time.time() - t0, str(exc)[:200], status="skipped")
+    except etherscan.EtherscanError as exc:              # includes PlanRequired, OverBudget
+        return TickResult("ledger", False, (etherscan.budget().get("day") or 0) - before,
+                          time.time() - t0, str(exc)[:300], status="failed")
 
 
 # ── tape ──────────────────────────────────────────────────────────────────────

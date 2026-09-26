@@ -49,6 +49,12 @@ POOL_S = 60          # pool
 # outruns it -- a 458-wallet buy wave did, costing a re-read of every wallet. Polling the free
 # feed faster during a burst keeps up at no GMGN cost.
 TAPE_FAST_S = 10
+# With a transfer ledger: how often it syncs (Etherscan, not GMGN), how long to wait before
+# retrying one that failed, and how often the GMGN holder census -- now only for TAGS, since the
+# ledger already has every holder -- runs.
+LEDGER_S = 30
+LEDGER_RETRY_S = 600
+CENSUS_EXACT_S = 6 * 3600
 INVENTORY_S = 300    # delta inventory
 CENSUS_S = 3600      # full census + full inventory reconciliation
 
@@ -635,6 +641,11 @@ async def api_refresh(request: Request, token_id: int = 1, full: bool = False) -
                                    ("census", T.track_census, ())):
                 j["stage"] = name
                 j.pop("progress", None)
+                if name == "inventory" and _ledger_ok(token_id):
+                    r = await asyncio.to_thread(T.track_ledger, token_id)
+                    j["results"].append(vars(r))
+                    if r.ok:
+                        continue                   # exact balances; no wallet sweep needed
                 if name == "inventory":
                     # A sweep with no visible progress is indistinguishable from a hung one,
                     # and the operator's only other signal is a page of zeros.
@@ -949,7 +960,15 @@ async def _onboard_scan(token_id: int) -> None:
         st["done"], st["of"] = done, of
 
     try:
-        r = await asyncio.to_thread(T.track_inventory, token_id, True, 3600, progress)
+        from plutus.sources import etherscan as _E
+        t = db.token_row(token_id)
+        r = None
+        if t is not None and _E.available(t["chain"]):
+            # The transfer ledger reads EVERY holder exactly for a few calls; no wallet sweep.
+            st["stage"] = "ledger"
+            r = await asyncio.to_thread(T.track_ledger, token_id)
+        if r is None or not r.ok:
+            r = await asyncio.to_thread(T.track_inventory, token_id, True, 3600, progress)
         st.update(ok=r.ok, detail=r.detail)
         # The first pool check and the first census belong to ONBOARDING, which the operator
         # asked for -- not to the background loop. Left to the loop, a 458-wallet onboarding had
@@ -1000,6 +1019,12 @@ def _stop_tasks(token_id: int) -> int:
     return n
 
 
+def _ledger_ok(token_id: int) -> bool:
+    from plutus.sources import etherscan as _E
+    t = db.token_row(token_id)
+    return t is not None and _E.available(t["chain"])
+
+
 def _inventory_busy(token_id: int) -> bool:
     """Is a full read of this token's wallets already running -- here, or in ANY process?
 
@@ -1031,8 +1056,10 @@ async def _loop(token_id: int) -> None:
     whole web server -- every page, every viewer -- for the length of each call.
     """
     last_census = float(db.latest_census_ts(token_id) or 0)
-    last_inv = last_pool = 0.0
+    last_inv = last_pool = last_ledger = ledger_retry_at = 0.0
     paused_until = 0.0
+    from plutus.sources import etherscan as _E
+    chain = (db.token_row(token_id) or {"chain": ""})["chain"]
     said: dict[str, str] = {}
 
     def once(key: str, msg: str) -> None:
@@ -1067,6 +1094,19 @@ async def _loop(token_id: int) -> None:
                 once("tape", f"token {token_id} tape: {r.detail}")
             burst = bool(r.ok and r.done and r.done >= T.gecko.TRADES_WINDOW // 2)
             now = time.time()
+
+            # The transfer ledger is Etherscan, not GMGN: it keeps syncing while GMGN background
+            # work is paused. A failure falls back to per-wallet reads and retries later.
+            if (chain and _E.available(chain) and now >= ledger_retry_at
+                    and now - last_ledger >= LEDGER_S):
+                last_ledger = now
+                r = await asyncio.to_thread(T.track_ledger, token_id)
+                if r.ok:
+                    said.pop("ledger", None)
+                else:
+                    once("ledger", f"token {token_id} transfer ledger: {r.detail}")
+                    ledger_retry_at = now + LEDGER_RETRY_S
+            exact = db.ledger_healthy(token_id)
             if now < paused_until:
                 await asyncio.sleep(TAPE_FAST_S if burst else TICK_S)
                 continue
@@ -1084,8 +1124,9 @@ async def _loop(token_id: int) -> None:
                 if not r.ok:
                     once("pool", f"token {token_id} pool: {r.detail}")
 
-            # The census goes first. Routine wallet re-reads never spend budget it needs.
-            if now - last_census > CENSUS_S:
+            # The census goes first. Routine wallet re-reads never spend budget it needs. With a
+            # ledger it is only for holder TAGS, so it runs far less often.
+            if now - last_census > (CENSUS_EXACT_S if exact else CENSUS_S):
                 r = await asyncio.to_thread(T.track_census, token_id, background=True)
                 if r.resume_at:
                     paused_until = pause(r)
@@ -1101,7 +1142,8 @@ async def _loop(token_id: int) -> None:
 
             # Wallets: never-read ones, gap-affected ones, the pool contract, and a few of the
             # stalest on a rolling schedule. Full re-reads of every wallet are operator actions.
-            if now - last_inv > INVENTORY_S and not _inventory_busy(token_id):
+            # With a trusted ledger there is nothing to read wallet by wallet.
+            if not exact and now - last_inv > INVENTORY_S and not _inventory_busy(token_id):
                 r = await asyncio.to_thread(T.track_inventory, token_id, background=True,
                                             reconcile=INVENTORY_S)
                 last_inv = now

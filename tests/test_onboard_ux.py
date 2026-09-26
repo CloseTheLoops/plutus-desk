@@ -9,6 +9,9 @@ Three problems found in production:
 """
 from __future__ import annotations
 
+import os as _os_guard
+_os_guard.environ.setdefault("PLUTUS_ETHERSCAN_DISABLE", "1")   # never real Etherscan here
+
 import asyncio
 import importlib
 import os
