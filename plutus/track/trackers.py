@@ -191,6 +191,19 @@ URGENT_WEAK_S = 3 * 3600
 DRIFT_TOLERANCE = 0.001
 # A staking/locking contract moving by more than this share of supply between two reads.
 LOCKED_JUMP = 0.0005
+# The pool and staking contracts are re-read this often -- often enough to catch staking within
+# minutes, not so often that two tokens spend 1,100 calls a day on four addresses.
+CONTRACT_REREAD_S = 600
+# ROUTINE re-reads stop once background usage passes this share of the background ceiling,
+# leaving the rest for the census and for correcting PROVEN drift. Without it, two tokens' steady
+# re-reads plus another process's calls filled the daily ceiling, background paused completely,
+# and a known 3.4% error in our position waited behind routine work for five hours.
+ROUTINE_SHARE = 0.8
+# ...but routine never stops outright. Under sustained pressure it still re-reads any wallet older
+# than this, so the longest a wallet can go unread is bounded. Stopping completely let wallets
+# reach 32h after a heavy day, visible only as an "overdue" note.
+HARD_STALE_S = 2 * RECONCILE_S
+_RECONCILE_CREDIT: dict[int, float] = {}
 
 # Calls held back from every sweep so a live campaign can still read prices and quotes when a
 # large inventory sweep would otherwise spend the hour's budget.
@@ -265,7 +278,16 @@ def track_inventory(token_id: int, full: bool = False, window_s: int = 3600,
         db.release_scan_lock(token_id, owner)
 
 
-def _reconcile_pick(token_id: int, candidates: list[str], rows: dict, step_s: float) -> list[str]:
+def _routine_allowed() -> bool:
+    b = gmgn.budget(background=True)
+    if b.get("hour") is None:
+        return True
+    return (b["hour"] < ROUTINE_SHARE * b["hour_cap"]
+            and b["day"] < ROUTINE_SHARE * b["day_cap"])
+
+
+def _reconcile_pick(token_id: int, candidates: list[str], rows: dict, step_s: float,
+                    split: bool = False):
     """The wallets to re-read this step: the smallest steady rate that meets every deadline.
 
     Each wallet's deadline is its last read plus its limit -- RECONCILE_S normally, ZERO_RECHECK_S
@@ -280,7 +302,7 @@ def _reconcile_pick(token_id: int, candidates: list[str], rows: dict, step_s: fl
     of that cohort early, which spreads it out for good, at the same average cost.
     """
     if not step_s:
-        return []
+        return ([], []) if split else []
     now = db.now()
     fills = db.fills_after(token_id, {a: (rows[a][1], rows[a][2]) for a in candidates if a in rows})
     drifted = db.drift_since(token_id, now - RECONCILE_S)
@@ -300,13 +322,28 @@ def _reconcile_pick(token_id: int, candidates: list[str], rows: dict, step_s: fl
             deadline = min(deadline, strong + URGENT_S)
         elif weak and obs < weak:
             deadline = min(deadline, weak + URGENT_WEAK_S)
-        deadlines.append((deadline, a))
+        # URGENT means "read before the movement was caught" -- judged by WHEN it was read, never by
+        # which deadline happens to be earlier. Judged by deadline, 209 wallets read before a stake
+        # were filed as routine because their routine deadline came first, were throttled with
+        # routine work, and the correction took three hours to start.
+        urgent = bool((strong and obs < strong) or (weak and obs < weak))
+        deadlines.append((deadline, a, urgent))
     if not deadlines:
-        return []
+        return ([], []) if split else []
     deadlines.sort()
-    rate = max(k / max(d - now, step_s) for k, (d, _a) in enumerate(deadlines, 1))
-    n = math.ceil(rate * step_s - 1e-9)
-    return [a for _d, a in deadlines[:n]]
+    rate = max(k / max(d - now, step_s) for k, (d, _a, _u) in enumerate(deadlines, 1))
+    if split:
+        # FRACTIONAL CREDIT carried between steps, so the average is the true minimum rate.
+        # Rounding each step up doubled a 150-wallet token's re-reads (13/h became 24/h).
+        credit = _RECONCILE_CREDIT.get(token_id, 0.0) + rate * step_s
+        n = int(credit + 1e-9)
+        _RECONCILE_CREDIT[token_id] = credit - n
+    else:
+        n = math.ceil(rate * step_s - 1e-9)
+    picked = deadlines[:n]
+    if not split:
+        return [a for _d, a, _u in picked]
+    return [a for _d, a, u in picked if u], [a for _d, a, u in picked if not u]
 
 
 def _inventory(token_id: int, full: bool, window_s: int, progress, fresh: bool,
@@ -324,6 +361,8 @@ def _inventory(token_id: int, full: bool, window_s: int, progress, fresh: bool,
     if not ours and not others:
         return TickResult("inventory", False, 0, 0.0, "nothing classified yet — run onboarding")
 
+    urgent_set: set[str] = set()
+    routine_set: set[str] = set()
     if full:
         targets = ours + others
     else:
@@ -338,15 +377,24 @@ def _inventory(token_id: int, full: bool, window_s: int, progress, fresh: bool,
         behind_gap = {a for a in ours if gap_ts and a in rows and rows[a][2] < gap_ts}
         # Wallets a full pull could not reach are QUEUED: read before the operator's request,
         # they are picked up here as the background budget allows.
+        urgent_picks, routine_picks = _reconcile_pick(token_id, ours + others, rows, reconcile,
+                                                      split=True)
+        if routine_picks and background and not _routine_allowed():
+            # Budget is tight: the census and proven drift go first, and routine shrinks to the
+            # wallets that would otherwise pass the hard limit.
+            hard = db.now() - HARD_STALE_S + reconcile
+            routine_picks = [a for a in routine_picks if a in rows and rows[a][2] < hard]
+        urgent_set, routine_set = set(urgent_picks), set(routine_picks)
         req_ts = db.full_request_ts(token_id)
         requested = {a for a in ours + others if req_ts and a in rows and rows[a][2] < req_ts}
         # The pool moves on every fill, and a staking / locking contract moves whenever anyone
         # stakes: both are re-read every step -- a handful of addresses, and the ledger is wrong
         # about everyone's float while either is stale.
         targets = sorted((set(ours) - known) | behind_gap | requested
-                         | {a for a in others if cmap[a] in ("pool", "locked")}
+                         | {a for a in others if cmap[a] in ("pool", "locked")
+                            and (a not in rows or db.now() - rows[a][2] >= CONTRACT_REREAD_S - 30)}
                          | (set(others) - known)
-                         | set(_reconcile_pick(token_id, ours + others, rows, reconcile)))
+                         | set(urgent_picks) | set(routine_picks))
 
     skipped = [w for w in targets if not config.is_address(chain, w)]
     targets = [w for w in targets if config.is_address(chain, w)]
@@ -362,13 +410,17 @@ def _inventory(token_id: int, full: bool, window_s: int, progress, fresh: bool,
 
     def priority(w: str) -> tuple:
         cls = cmap.get(w)
-        if cls == "pool":
-            return (0, 0)                      # the ledger is meaningless without the pool
+        if cls in ("pool", "locked"):
+            return (0, 0)                      # the ledger is meaningless without these
         if w not in latest:
             return (1 if cls != "ours" else 2, 0)
         if cls == "ours" and gap_ts and latest[w][2] < gap_ts:
             return (3, latest[w][2])           # its roll-forward may be missing fills
-        return (4, latest[w][2])               # then stalest first
+        if w in urgent_set:
+            return (3, latest[w][2])           # correcting PROVEN drift comes before routine
+        if w in routine_set:
+            return (5, latest[w][2])           # routine last
+        return (4, latest[w][2])
 
     targets.sort(key=priority)
     n_total = len(targets)
@@ -489,8 +541,12 @@ def _inventory(token_id: int, full: bool, window_s: int, progress, fresh: bool,
         level("inventory for token %s: %d balance read(s) failed, e.g. %s",
               token_id, len(failed), first_error[0] if first_error else "?")
     # Deferred wallets are read by the BACKGROUND sweep, so that tier says when they will be.
-    resume_at = (gmgn.budget(background=True, need=len(deferred)).get("resumes_at")
-                 if deferred else None)
+    # Pause background work only when something ESSENTIAL was deferred. Routine re-reads that
+    # did not fit simply wait for a later step; pausing everything for them also held back the
+    # corrections the budget was supposed to protect.
+    essential = [w for w in deferred if w not in routine_set]
+    resume_at = (gmgn.budget(background=True, need=len(essential)).get("resumes_at")
+                 if essential else None)
     status = ("ok" if ok else "partial" if deferred and rows else "deferred" if deferred
               else "failed")
     return TickResult("inventory", ok, calls, time.time() - t0, resume_at=resume_at,

@@ -52,6 +52,11 @@ WORKER = textwrap.dedent("""
                     time.sleep(gap)
                 _last[0] = time.time()
         gmgn._pace = _legacy
+    # Start together. Process startup on Windows can take long enough that one worker finishes
+    # before the other begins -- then the two never overlap, the rate is never doubled, and the
+    # control test failed for a reason that had nothing to do with the pacer.
+    start_at = float(sys.argv[3]) if len(sys.argv) > 3 else 0.0
+    time.sleep(max(0.0, start_at - time.time()))
     out = []
     for _ in range(int(sys.argv[1])):
         gmgn._pace()
@@ -63,7 +68,9 @@ WORKER = textwrap.dedent("""
 def _two_processes(n: int, mode: str = "shared") -> list[float]:
     script = pathlib.Path(tempfile.gettempdir()) / f"plutus_pace_{mode}.py"
     script.write_text(WORKER, encoding="utf-8")
-    args = [sys.executable, str(script), str(n)] + (["legacy"] if mode == "legacy" else [])
+    start_at = time.time() + 3.0
+    args = [sys.executable, str(script), str(n), "legacy" if mode == "legacy" else "shared",
+            f"{start_at:.3f}"]
     procs = [subprocess.Popen(args, stdout=subprocess.PIPE, text=True) for _ in range(2)]
     stamps: list[float] = []
     for p in procs:

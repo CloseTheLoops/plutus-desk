@@ -71,18 +71,21 @@ class RestartSim(BaseException):
 
 # ═══════════════════════════════════════════════════════════════════ the simulated chain
 class World:
-    def __init__(self, seed=7):
+    def __init__(self, seed=7, token=None, pid=None, stake=None, n_ours=None, n_third=None,
+                 ours_base=0x1000, third_base=0x900000):
+        self.token, self.pid, self.stake = token or TOKEN, pid or PID, stake or STAKE
+        n_ours, n_third = n_ours or N_OURS, n_third or N_THIRD
         self.rng = random.Random(seed)
         self.bal: dict[str, float] = {}
         self.changed: dict[str, int] = {}
         self.trades: list[dict] = []
-        self.ours = ["0x%040x" % (0x1000 + i) for i in range(N_OURS)]
-        self.third = ["0x%040x" % (0x900000 + i) for i in range(N_THIRD)]
+        self.ours = ["0x%040x" % (ours_base + i) for i in range(n_ours)]
+        self.third = ["0x%040x" % (third_base + i) for i in range(n_third)]
         self.R, self.Q = 140_000_000.0, 12_000.0
         self.bal[POOL] = self.R
         for w in self.ours:
             self.bal[w] = 1_000_000.0
-        self.bal[STAKE] = 50_000_000.0
+        self.bal[self.stake] = 50_000_000.0
         self.bal[DEAD] = 1_000_000.0
         rest = SUPPLY - sum(self.bal.values())
         weights = [self.rng.random() ** 3 for _ in self.third]
@@ -149,15 +152,16 @@ class World:
         flags = {args[i]: args[i + 1] for i in range(len(cmd), len(args) - 1, 2)}
         if cmd == ("portfolio", "token-balance"):
             w = flags["--wallet"]
-            return {"balances": [{"token_address": TOKEN, "balance": str(self.bal.get(w, 0.0)),
+            return {"balances": [{"token_address": self.token, "balance": str(self.bal.get(w, 0.0)),
                                   "height": self.changed.get(w, self.block() - 10_000)}]}
         if cmd == ("token", "pool"):
-            return {"base_reserve": self.R, "quote_reserve": self.Q, "pool_address": PID,
+            return {"base_reserve": self.R, "quote_reserve": self.Q, "pool_address": self.pid,
                     "liquidity": 2 * self.Q}
         if cmd == ("token", "info"):
             return {"holder_count": sum(1 for v in self.bal.values() if v > 0), "symbol": "SIM"}
         if cmd == ("token", "traders"):
-            holders = [(a, v) for a, v in self.bal.items() if v > 0 and a not in (POOL, STAKE, DEAD)]
+            holders = [(a, v) for a, v in self.bal.items()
+                       if v > 0 and a not in (POOL, self.stake, DEAD)]
             ob, tag = flags.get("--order-by"), flags.get("--tag")
             if ob == "amount_percentage":
                 holders.sort(key=lambda x: -x[1])
