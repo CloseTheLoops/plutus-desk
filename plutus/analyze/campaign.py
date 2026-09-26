@@ -209,6 +209,8 @@ def status(cid: int, pool: Pool, led: L.Ledger) -> Status | None:
         _acquire(st, p, b, pool, led, fl)
     elif c["kind"] == "distribute":
         _distribute(st, p, b, pool, led, fl)
+    # Advice built on holders must say when the census under it is partial.
+    st.notes.extend(n for n in L.census_notes(c["token_id"]) if n.startswith("CENSUS PARTIAL"))
     return st
 
 

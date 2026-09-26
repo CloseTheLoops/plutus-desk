@@ -52,6 +52,21 @@ COMMIT_BUDGET_S = 0.004        # headroom for committing the reservation before 
 MAX_CALLS_HOUR = int(os.environ.get("PLUTUS_MAX_CALLS_HOUR") or 900)
 MAX_CALLS_DAY = int(os.environ.get("PLUTUS_MAX_CALLS_DAY") or 6000)
 
+# ── background work gets its own, smaller ceiling ─────────────────────────────
+# WHY. With nobody using the desk, the background loop spent 9,999 of a 10,000 daily budget and
+# held it there from 01:00 onward. One ceiling for everything meant background sweeps could
+# consume the whole of it, and then the operator's own actions -- a full pull, onboarding a token,
+# a live campaign -- were refused by work nobody had asked for. Background calls now stop at a
+# share of each cap; the rest is kept for what the operator does, which is never starved.
+BG_HOUR_SHARE = float(os.environ.get("PLUTUS_BG_HOUR_SHARE") or 0.5)
+BG_DAY_SHARE = float(os.environ.get("PLUTUS_BG_DAY_SHARE") or 0.6)
+
+
+def _caps(background: bool) -> tuple[int, int]:
+    if background:
+        return int(MAX_CALLS_HOUR * BG_HOUR_SHARE), int(MAX_CALLS_DAY * BG_DAY_SHARE)
+    return MAX_CALLS_HOUR, MAX_CALLS_DAY
+
 # ── response cache ────────────────────────────────────────────────────────────
 # WHY DELETE + RE-ONBOARD SHOULD BE CHEAP, WITHOUT WEAKENING WHAT DELETE MEANS.
 # Deleting a token removes the token: its rows, its id, its history. Re-adding it is a genuine
@@ -131,6 +146,10 @@ class GmgnError(RuntimeError):
 
 class BudgetExceeded(GmgnError):
     """The call budget is spent. Not a failure to retry -- a limit to wait out."""
+
+
+class RateLimited(GmgnError):
+    """GMGN answered 429. Every caller has already been paused; never retried on another path."""
 
 
 def _env() -> dict[str, str] | None:
@@ -237,7 +256,7 @@ def _get_session():
         return _session
 
 
-def _http_call(args: tuple[str, ...]) -> Any:
+def _http_call(args: tuple[str, ...], background: bool = False) -> Any:
     """Serve one call over HTTP, or raise _NoRoute so the caller falls back to the CLI."""
     route = _ROUTES.get(tuple(args[:2])) or _ROUTES.get(tuple(args[:1]))
     if route is None:
@@ -259,13 +278,14 @@ def _http_call(args: tuple[str, ...]) -> Any:
     params["timestamp"] = int(time.time())
     params["client_id"] = str(uuid.uuid4())
 
-    _pace()
+    _pace(background)
     r = _get_session().request(
         method, HOST + path, params=params, timeout=TIMEOUT,
         headers={"X-APIKEY": key, "Content-Type": "application/json",
                  "User-Agent": "gmgn-cli/1.5.6"})
     if r.status_code == 429:
-        raise GmgnError(f"RATE_LIMIT {path}: {r.text[:160]}")
+        pause_all(min((_cooldown("RATE_LIMIT " + r.text) or 35) + 3, MAX_WAIT_S), path)
+        raise RateLimited(f"RATE_LIMIT {path}: {r.text[:160]}")
     if r.status_code != 200:
         raise GmgnError(f"http {r.status_code} {path}: {r.text[:160]}")
     body = r.json()
@@ -309,7 +329,7 @@ def _pace_db() -> sqlite3.Connection:
         return _pace_conn
 
 
-def _reserve_slot() -> float:
+def _reserve_slot(background: bool = False) -> float:
     """Claim the next free moment to call, and return how long to wait for it.
 
     RESERVATION, NOT A HELD LOCK. The obvious implementation -- open a write transaction, read
@@ -334,8 +354,9 @@ def _reserve_slot() -> float:
         row = c.execute("SELECT next_free FROM rate_state WHERE k='gmgn'").fetchone()
         nxt = float(row[0]) if row else 0.0
         # A value far in the future means a clock change or a crashed reservation, not a real
-        # queue. Waiting it out would stall every caller for as long as the skew.
-        if nxt > now + 5.0:
+        # queue. Waiting it out would stall every caller for as long as the skew. The bound is
+        # the longest DELIBERATE wait -- a global pause after a 429 -- so a real pause is kept.
+        if nxt > now + MAX_WAIT_S + 60:
             nxt = now
         # COMMIT_BUDGET keeps the slot marginally in the future so that committing and
         # returning does not overshoot it. Without it the very first call of a process -- the
@@ -348,17 +369,13 @@ def _reserve_slot() -> float:
                          (now - 3600,)).fetchone()[0]
         day = c.execute("SELECT COUNT(*) FROM call_log WHERE ts > ?",
                         (now - 86400,)).fetchone()[0]
-        if hour >= MAX_CALLS_HOUR or day >= MAX_CALLS_DAY:
+        hcap, dcap = _caps(background)
+        if hour >= hcap or day >= dcap:
             c.execute("COMMIT")
-            which = "hourly" if hour >= MAX_CALLS_HOUR else "daily"
-            cap = MAX_CALLS_HOUR if which == "hourly" else MAX_CALLS_DAY
+            which = "hourly" if hour >= hcap else "daily"
             raise BudgetExceeded(
-                f"{which} API call budget spent: {hour} this hour / {day} today "
-                f"(cap {cap}). Refusing to call rather than risk the key. This usually means "
-                f"something is re-scanning: prefer a full pull over delete+re-onboard, which "
-                f"repeats discovery, calibration and classification for nothing. "
-                f"Raise PLUTUS_MAX_CALLS_{'HOUR' if which == 'hourly' else 'DAY'} if the cap "
-                f"itself is wrong.")
+                f"{'background ' if background else ''}{which} GMGN budget spent: {hour} this "
+                f"hour / {day} today (cap {hcap if which == 'hourly' else dcap})")
         c.execute("INSERT INTO call_log (ts) VALUES (?)", (now,))
         start = max(now + COMMIT_BUDGET_S, nxt)
         c.execute("INSERT INTO rate_state (k, next_free) VALUES ('gmgn', ?) "
@@ -380,7 +397,7 @@ def _reserve_slot() -> float:
         return max(0.0, start - now)
 
 
-def _pace() -> None:
+def _pace(background: bool = False) -> None:
     """Hold the global minimum interval between calls -- across threads AND processes.
 
     WHY THIS IS NOT JUST A LOCK. A threading.Lock serialises the calls inside one interpreter and
@@ -394,27 +411,69 @@ def _pace() -> None:
     threads, and keeps them from contending on the database row one at a time.
     """
     with _rate_lock:
-        wait = _reserve_slot()            # raises BudgetExceeded rather than spending
+        wait = _reserve_slot(background)  # raises BudgetExceeded rather than spending
     if wait > 0:
         time.sleep(wait)
 
 
-def budget() -> dict:
-    """Where the budget stands. Read-only; safe to call from a page."""
+def budget(background: bool = False, need: int = 1) -> dict:
+    """Where the budget stands for a tier, and WHEN `need` more calls will be allowed.
+
+    `left` is the smaller of what the hour and the day allow, because either can be the one that
+    binds -- the sweep that spent a daily budget to the last call only ever looked at the hour.
+    `resumes_at` is when enough calls will have aged out of their window: a caller that cannot
+    afford its work sleeps until then instead of retrying against a spent cap.
+    """
     now = time.time()
+    hcap, dcap = _caps(background)
     try:
         c = _pace_db()
         hour = c.execute("SELECT COUNT(*) FROM call_log WHERE ts > ?",
                          (now - 3600,)).fetchone()[0]
         day = c.execute("SELECT COUNT(*) FROM call_log WHERE ts > ?",
                         (now - 86400,)).fetchone()[0]
+        resumes = now
+        for window, used, cap in ((3600, hour, hcap), (86400, day, dcap)):
+            excess = used - (cap - need)
+            if excess > 0:
+                row = c.execute("SELECT ts FROM call_log WHERE ts > ? ORDER BY ts LIMIT 1 "
+                                "OFFSET ?", (now - window, excess - 1)).fetchone()
+                if row:
+                    resumes = max(resumes, float(row[0]) + window)
     except sqlite3.Error:
-        return {"hour": None, "day": None, "hour_cap": MAX_CALLS_HOUR,
-                "day_cap": MAX_CALLS_DAY, "ok": True}
-    return {"hour": hour, "day": day, "hour_cap": MAX_CALLS_HOUR, "day_cap": MAX_CALLS_DAY,
-            "hour_left": max(0, MAX_CALLS_HOUR - hour),
-            "day_left": max(0, MAX_CALLS_DAY - day),
-            "ok": hour < MAX_CALLS_HOUR and day < MAX_CALLS_DAY}
+        return {"hour": None, "day": None, "hour_cap": hcap, "day_cap": dcap, "left": None,
+                "hour_left": None, "day_left": None, "resumes_at": now, "ok": True}
+    hl, dl = max(0, hcap - hour), max(0, dcap - day)
+    return {"hour": hour, "day": day, "hour_cap": hcap, "day_cap": dcap,
+            "hour_left": hl, "day_left": dl, "left": min(hl, dl), "resumes_at": resumes,
+            "background": background, "ok": hour < hcap and day < dcap}
+
+
+def pause_all(seconds: float, why: str = "") -> None:
+    """Hold EVERY caller -- every thread, every process on this key -- for `seconds`.
+
+    A 429 is about the key, not the thread that happened to receive it. Handled per thread, the
+    other workers kept firing into the same limit and extending it, and the CLI fallback made the
+    same request again on a second transport. So the pause is written into the shared rate_state
+    row: every reservation after it is handed a slot after the pause ends.
+    """
+    global _last_call
+    until = time.time() + max(0.0, seconds)
+    extended = False
+    try:
+        c = _pace_db()
+        c.execute("BEGIN IMMEDIATE")
+        row = c.execute("SELECT next_free FROM rate_state WHERE k='gmgn'").fetchone()
+        if until > (float(row[0]) if row else 0.0):
+            c.execute("INSERT INTO rate_state (k, next_free) VALUES ('gmgn', ?) "
+                      "ON CONFLICT(k) DO UPDATE SET next_free=excluded.next_free", (until,))
+            extended = True
+        c.execute("COMMIT")
+    except sqlite3.Error:
+        _last_call, extended = max(_last_call, until), True
+    if extended:
+        log.warning("GMGN rate limit%s — every worker paused for %ds",
+                    f" on {why}" if why else "", int(seconds))
 
 
 def _cooldown(err: str) -> int | None:
@@ -424,7 +483,7 @@ def _cooldown(err: str) -> int | None:
     return int(m.group(1)) if m else 35
 
 
-def call(*args: str, attempts: int = 3, fresh: bool = False) -> Any:
+def call(*args: str, attempts: int = 3, fresh: bool = False, background: bool = False) -> Any:
     """Run one CLI command with --raw and return parsed JSON.
 
     attempts=1 means fail fast: for callers inside a latency-sensitive loop where waiting out a
@@ -444,21 +503,30 @@ def call(*args: str, attempts: int = 3, fresh: bool = False) -> Any:
             return body
 
     if USE_HTTP:
-        try:
-            got = _http_call(args)
-            _cache_put(args, got)
-            return got
-        except _NoRoute:
-            pass                                   # no route — fall through to the CLI
-        except BudgetExceeded:
-            raise                          # a spent budget is not something to retry elsewhere
-        except GmgnError:
-            log.warning("http path failed for %s, falling back to the CLI", " ".join(args[:3]))
+        for attempt in range(1, attempts + 1):
+            try:
+                got = _http_call(args, background=background)
+                _cache_put(args, got)
+                return got
+            except _NoRoute:
+                break                              # no route — fall through to the CLI
+            except BudgetExceeded:
+                raise                      # a spent budget is not something to retry elsewhere
+            except RateLimited:
+                # The pause is already recorded for every caller, so the retry waits it out in
+                # _pace. What must NOT happen is the CLI making the same request on the same key
+                # mid-limit: that was a second call into an active 429.
+                if attempt == attempts:
+                    raise
+            except GmgnError:
+                log.warning("http path failed for %s, falling back to the CLI",
+                            " ".join(args[:3]))
+                break
 
     cmd = [*CLI, *args, "--raw"]
 
     for attempt in range(1, attempts + 1):
-        _pace()
+        _pace(background)
         try:
             p = subprocess.run(cmd, capture_output=True, text=True, timeout=TIMEOUT,
                                encoding="utf-8", env=_env(), creationflags=_NO_WINDOW)
@@ -476,9 +544,8 @@ def call(*args: str, attempts: int = 3, fresh: bool = False) -> Any:
         if attempt == attempts:
             break
         if (wait := _cooldown(err)) is not None:
-            wait = min(wait + 3, MAX_WAIT_S)
-            log.warning("gmgn rate-limited, honouring reset in %ds", wait)
-            time.sleep(wait)
+            # Pause EVERY caller, not this thread; the next _pace waits it out.
+            pause_all(min(wait + 3, MAX_WAIT_S), " ".join(args[:2]))
         else:
             log.warning("gmgn failed (attempt %d): %s", attempt, err[:200])
             time.sleep(2 * attempt)
@@ -486,15 +553,16 @@ def call(*args: str, attempts: int = 3, fresh: bool = False) -> Any:
 
 
 # ── typed wrappers ────────────────────────────────────────────────────────────
-def token_info(chain: str, address: str) -> dict:
+def token_info(chain: str, address: str, background: bool = False) -> dict:
     """NOTE the data shape: `price` comes back as a NESTED OBJECT, not a scalar, and several
     numerics are strings. Flattened once here so no caller has to know that."""
-    d = call("token", "info", "--chain", chain, "--address", address)
+    d = call("token", "info", "--chain", chain, "--address", address, background=background)
     return d if isinstance(d, dict) else {}
 
 
-def token_pool(chain: str, address: str, fresh: bool = False) -> dict:
-    return call("token", "pool", "--chain", chain, "--address", address, fresh=fresh) or {}
+def token_pool(chain: str, address: str, fresh: bool = False, background: bool = False) -> dict:
+    return call("token", "pool", "--chain", chain, "--address", address, fresh=fresh,
+                background=background) or {}
 
 
 def balance_cached(chain: str, wallet: str, token: str) -> bool:
@@ -513,24 +581,25 @@ def token_security(chain: str, address: str) -> dict:
 
 
 def traders(chain: str, address: str, order_by: str = "amount_percentage",
-            tag: str | None = None, limit: int = 100, attempts: int = 2) -> list[dict]:
+            tag: str | None = None, limit: int = 100, attempts: int = 2,
+            background: bool = False) -> list[dict]:
     args = ["token", "traders", "--chain", chain, "--address", address,
             "--limit", str(limit), "--order-by", order_by]
     if tag:
         args += ["--tag", tag]
-    d = call(*args, attempts=attempts)
+    d = call(*args, attempts=attempts, background=background)
     return (d or {}).get("list") or []
 
 
-def token_balance(chain: str, wallet: str, token: str,
-                  fresh: bool = False) -> tuple[float, int | None]:
+def token_balance(chain: str, wallet: str, token: str, fresh: bool = False,
+                  background: bool = False) -> tuple[float, int | None]:
     """Direct balance for one wallet. Returns (tokens, block_height_of_last_change).
 
     `height` is free provenance the vendor hands us: the block at which this balance last CHANGED.
     Recorded, never discarded.
     """
     d = call("portfolio", "token-balance", "--chain", chain, "--wallet", wallet,
-             "--token", token, attempts=2, fresh=fresh)
+             "--token", token, attempts=2, fresh=fresh, background=background)
     for e in (d or {}).get("balances") or []:
         if (e.get("token_address") or "").lower() == token.lower():
             return float(e.get("balance") or 0), (int(e["height"]) if e.get("height") else None)

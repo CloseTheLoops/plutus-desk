@@ -14,8 +14,12 @@ measurement that made capture-rate possible, paying for itself twice.
 """
 from __future__ import annotations
 
+import math
+import os
+import socket
 import threading
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
@@ -32,6 +36,8 @@ class TickResult:
     calls: int = 0
     seconds: float = 0.0
     detail: str = ""
+    # When a step was held back for budget: the time its calls will be affordable again.
+    resume_at: float | None = None
 
 
 def _ctx(token_id: int) -> tuple[str, str, str]:
@@ -42,7 +48,7 @@ def _ctx(token_id: int) -> tuple[str, str, str]:
 
 
 # ── pool ──────────────────────────────────────────────────────────────────────
-def track_pool(token_id: int, verify: bool = False) -> TickResult:
+def track_pool(token_id: int, verify: bool = False, background: bool = False) -> TickResult:
     if aborted(token_id):
         return TickResult("pool", False, 0, 0.0,
                           "skipped — the token was deleted")
@@ -71,7 +77,7 @@ def track_pool(token_id: int, verify: bool = False) -> TickResult:
     vendor, calls, note = None, 0, ""
     if need_check or not (free is not None and trusted):
         try:
-            vendor = gmgn.token_pool(chain, address, fresh=need_check)
+            vendor = gmgn.token_pool(chain, address, fresh=need_check, background=background)
             calls += 1
         except gmgn.GmgnError as exc:
             if not (free is not None and trusted):
@@ -159,7 +165,16 @@ def track_tape(token_id: int) -> TickResult:
 # ran the same work 7.2x faster. The global pacer still caps the process at
 # 1/MIN_INTERVAL_S calls per second, so raising this trades latency for nothing once the
 # pacer binds -- it is deliberately well under that ceiling.
-BALANCE_WORKERS = 8
+BALANCE_WORKERS = int(os.environ.get("PLUTUS_BALANCE_WORKERS") or 4)
+
+# ── how often our wallets are re-read at all ──────────────────────────────────
+# Our position is rolled forward from our own fills, so a real read is only needed to catch what
+# fills cannot see: transfers, other venues, staking. That is a slow drift, so it is caught on a
+# slow ROLLING schedule -- each loop step re-reads the few stalest wallets -- not by re-reading
+# every wallet at once. Re-reading them all hourly was ~460 calls an hour at 458 wallets.
+RECONCILE_S = int(os.environ.get("PLUTUS_RECONCILE_S") or 12 * 3600)
+# A wallet at zero with no fills since its last read has nothing to drift: at most daily.
+ZERO_RECHECK_S = 24 * 3600
 
 # Calls held back from every sweep so a live campaign can still read prices and quotes when a
 # large inventory sweep would otherwise spend the hour's budget.
@@ -201,7 +216,57 @@ def clear_abort(token_id: int) -> None:
 
 
 def track_inventory(token_id: int, full: bool = False, window_s: int = 3600,
-                    progress=None, fresh: bool = False) -> TickResult:
+                    progress=None, fresh: bool = False, background: bool = False,
+                    reconcile: float = 0) -> TickResult:
+    """Read wallet balances. A FULL read takes a cross-process lock first.
+
+    `reconcile` is the loop's step length in seconds: when set, the step also re-reads the few
+    stalest wallets, sized so every wallet is re-read within RECONCILE_S.
+    """
+    if not full:
+        return _inventory(token_id, full, window_s, progress, fresh, background, reconcile)
+    owner = f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
+    holder = db.acquire_scan_lock(token_id, owner)
+    if holder is not None:
+        return TickResult("inventory", False, 0, 0.0,
+                          f"SKIPPED — a full read of this token is already running "
+                          f"({holder['owner']}, {db.now() - (holder['started'] or 0)}s ago)")
+    beat = [time.time()]
+
+    def heartbeat(done: int, of: int) -> None:
+        if time.time() - beat[0] > 30:
+            beat[0] = time.time()
+            db.refresh_scan_lock(token_id, owner)
+        if progress:
+            progress(done, of)
+
+    try:
+        return _inventory(token_id, full, window_s, heartbeat, fresh, background, reconcile)
+    finally:
+        db.release_scan_lock(token_id, owner)
+
+
+def _reconcile_pick(token_id: int, candidates: list[str], rows: dict, step_s: float) -> list[str]:
+    """The few stalest wallets due a re-read this step. Never-read ones are the delta's job."""
+    n = math.ceil(len(candidates) * step_s / RECONCILE_S) if step_s else 0
+    if not n:
+        return []
+    now = db.now()
+    fills = db.fills_after(token_id, {a: (rows[a][1], rows[a][2]) for a in candidates if a in rows})
+    due = []
+    for a in candidates:
+        if a not in rows:
+            continue
+        tok, _h, obs = rows[a]
+        idle_zero = (not tok) and a not in fills
+        if now - obs >= (ZERO_RECHECK_S if idle_zero else RECONCILE_S / 2):
+            due.append((obs, a))
+    due.sort()
+    return [a for _o, a in due[:n]]
+
+
+def _inventory(token_id: int, full: bool, window_s: int, progress, fresh: bool,
+               background: bool, reconcile: float) -> TickResult:
     """Our own holdings, by DIRECT per-wallet query. Never inferred from a ranked sweep —
     on the first token a ranked sweep saw barely a third of the operator's wallets; the direct query found all."""
     t0 = time.time()
@@ -230,7 +295,8 @@ def track_inventory(token_id: int, full: bool = False, window_s: int = 3600,
         # the pool moves on every fill, so it is always re-read
         targets = sorted((set(ours) - known) | behind_gap
                          | {a for a in others if cmap[a] == "pool"}
-                         | (set(others) - known))
+                         | (set(others) - known)
+                         | set(_reconcile_pick(token_id, ours + others, rows, reconcile)))
 
     skipped = [w for w in targets if not config.is_address(chain, w)]
     targets = [w for w in targets if config.is_address(chain, w)]
@@ -256,9 +322,11 @@ def track_inventory(token_id: int, full: bool = False, window_s: int = 3600,
 
     targets.sort(key=priority)
     deferred: list[str] = []
-    left = gmgn.budget().get("hour_left")
+    # `left` is the tighter of the hour and the day FOR THIS TIER: background work stops at its
+    # own share and never eats into what is kept for the operator.
+    left = gmgn.budget(background=background).get("left")
     if left is not None:
-        allowance = max(0, left - BUDGET_RESERVE)
+        allowance = max(0, left - (0 if background else BUDGET_RESERVE))
         chosen = []
         for w in targets:
             if not fresh and gmgn.balance_cached(chain, w, address):
@@ -274,17 +342,27 @@ def track_inventory(token_id: int, full: bool = False, window_s: int = 3600,
     # every derived figure reads zero. gmgn._pace() still enforces the global interval across
     # these threads, so the burst ceiling is unchanged.
     rows, calls, failed = [], 0, []
+    first_error: list[str] = []
+    stop = threading.Event()
 
     def _read(w: str):
         # Checked per wallet, not per sweep: a delete part-way through stops the rest rather
         # than paying for every remaining wallet on a token that is gone.
         if aborted(token_id):
             return w, None, "aborted"
+        # Once the budget refuses, the rest of this sweep is deferred WITHOUT asking again --
+        # asking again, once per wallet, is what wrote 27,000 refusal lines into the log.
+        if stop.is_set():
+            return w, None, "budget"
         try:
             # `fresh` is the operator pressing "full pull": an explicit request for current
             # numbers, so it goes past the cache. Onboarding and the background sweeps use it --
             # which is what makes deleting and re-adding a token within minutes cost nothing.
-            return w, gmgn.token_balance(chain, w, address, fresh=fresh), None
+            return w, gmgn.token_balance(chain, w, address, fresh=fresh,
+                                         background=background), None
+        except (gmgn.BudgetExceeded, gmgn.RateLimited):
+            stop.set()
+            return w, None, "budget"
         except gmgn.GmgnError as exc:
             return w, None, exc
 
@@ -295,6 +373,9 @@ def track_inventory(token_id: int, full: bool = False, window_s: int = 3600,
             if exc == "aborted":
                 skipped += 1
                 continue
+            if exc == "budget":
+                deferred.append(w)
+                continue
             if progress:
                 progress(done, len(targets))
             if exc is not None:
@@ -303,7 +384,8 @@ def track_inventory(token_id: int, full: bool = False, window_s: int = 3600,
                 # desk. Count them and fail the tick, or the UI reports a clean sweep over
                 # missing data.
                 failed.append(w)
-                log.warning("balance failed for %s: %s", w[:10], exc)
+                if not first_error:
+                    first_error.append(f"{w[:10]}: {str(exc)[:120]}")
             else:
                 calls += 1
                 rows.append((w, got[0], got[1]))
@@ -314,10 +396,12 @@ def track_inventory(token_id: int, full: bool = False, window_s: int = 3600,
                           f"not made because the token was deleted")
     db.record_balances(token_id, rows)
     ok = not failed and not deferred
-    if deferred:
-        log.info("inventory for token %s: %d wallet(s) deferred to protect the hourly budget",
-                 token_id, len(deferred))
-    return TickResult("inventory", ok, calls, time.time() - t0,
+    if failed:
+        log.warning("inventory for token %s: %d balance read(s) failed, e.g. %s",
+                    token_id, len(failed), first_error[0] if first_error else "?")
+    resume_at = (gmgn.budget(background=background, need=len(deferred)).get("resumes_at")
+                 if deferred else None)
+    return TickResult("inventory", ok, calls, time.time() - t0, resume_at=resume_at, detail=
                       (f"{len(deferred)} of {len(targets) + len(deferred)} wallets DEFERRED — "
                        f"the hour's API budget is committed; they are read next as it frees · "
                        if deferred else "") +
@@ -333,9 +417,10 @@ ORDER_BYS = ("amount_percentage", "profit", "unrealized_profit", "buy_volume_cur
 TAGS = ("smart_degen", "renowned", "fresh_wallet", "dev", "sniper", "rat_trader",
         "bundler", "transfer_in", "dex_bot", "bluechip_owner")
 TAG_ORDER_BYS = ("amount_percentage", "profit", "buy_volume_cur")
+CENSUS_SLICES = len(ORDER_BYS) + len(TAGS) * len(TAG_ORDER_BYS)
 
 
-def track_census(token_id: int) -> TickResult:
+def track_census(token_id: int, background: bool = False) -> TickResult:
     """Union of many ranked slices, because each caps at 100 rows.
 
     COVERAGE IS STATED, NEVER ASSUMED: a wallet missing from every slice is UNCOVERED, not
@@ -344,11 +429,24 @@ def track_census(token_id: int) -> TickResult:
     """
     t0 = time.time()
     chain, address, _ = _ctx(token_id)
-    need = len(ORDER_BYS) + len(TAGS) * len(TAG_ORDER_BYS)
-    left = gmgn.budget().get("hour_left")
-    if left is not None and need > left - BUDGET_RESERVE:
+    need = CENSUS_SLICES
+    b = gmgn.budget(background=background, need=need)
+    left = b.get("left")
+    if left is not None and need > left - (0 if background else BUDGET_RESERVE):
         return TickResult("census", False, 0, time.time() - t0,
-                          f"DEFERRED — a census needs {need} calls and {left} are left this hour")
+                          f"DEFERRED — a census needs {need} calls and {left} are available",
+                          resume_at=b.get("resumes_at"))
+
+    def interrupted(exc: Exception) -> TickResult:
+        # A census the budget cuts short is DISCARDED, not recorded. Recorded, it became the
+        # latest census -- 46 holders where the last complete one had 132 -- and everything
+        # built on holders silently used the partial one. The previous complete census stays.
+        log.info("census for token %s interrupted after %d slices (%s) — kept the previous "
+                 "complete census", token_id, slices, str(exc)[:80])
+        return TickResult("census", False, calls, time.time() - t0,
+                          f"INCOMPLETE after {slices} slices — budget; kept the previous census",
+                          resume_at=gmgn.budget(background=background,
+                                                need=CENSUS_SLICES).get("resumes_at"))
     rows: dict[str, dict] = {}
     tagged: dict[str, set[str]] = {}
     calls = slices = 0
@@ -374,10 +472,12 @@ def track_census(token_id: int) -> TickResult:
             return TickResult("census", False, calls, time.time() - t0,
                               f"ABORTED after {calls} slices — the token was deleted")
         try:
-            n = absorb(gmgn.traders(chain, address, order_by=ob), None)
+            n = absorb(gmgn.traders(chain, address, order_by=ob, background=background), None)
             calls += 1
             slices += 1
             log.debug("census order-by %s: +%d new (union %d)", ob, n, len(rows))
+        except (gmgn.BudgetExceeded, gmgn.RateLimited) as exc:
+            return interrupted(exc)
         except gmgn.GmgnError as exc:
             log.warning("census slice order-by %s FAILED: %s", ob, exc)
     for tg in TAGS:
@@ -388,9 +488,12 @@ def track_census(token_id: int) -> TickResult:
                               f"ABORTED after {calls} calls — the token was deleted")
         for ob in TAG_ORDER_BYS:
             try:
-                absorb(gmgn.traders(chain, address, order_by=ob, tag=tg), tg)
+                absorb(gmgn.traders(chain, address, order_by=ob, tag=tg,
+                                    background=background), tg)
                 calls += 1
                 slices += 1
+            except (gmgn.BudgetExceeded, gmgn.RateLimited) as exc:
+                return interrupted(exc)
             except gmgn.GmgnError:
                 pass
 
@@ -400,7 +503,7 @@ def track_census(token_id: int) -> TickResult:
     sweep = db.now()
     info = {}
     try:
-        info = gmgn.token_info(chain, address)
+        info = gmgn.token_info(chain, address, background=background)
         calls += 1
     except gmgn.GmgnError:
         pass

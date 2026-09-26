@@ -215,6 +215,31 @@ campaign — measured with 500 wallets — well inside it:
   reserve for prices and quotes, and picks up the rest as the hourly window frees. Onboarding no
   longer reads every wallet twice.
 
-The steady cost of a 500-wallet token is dominated by the hourly reconciliation (one read per
-wallet per hour). If that is too much alongside other tokens, `CENSUS_S` in `plutus/web/app.py`
-sets its interval.
+**Background work has its own ceiling.** Everything the tracker loop does on its own stops at
+`PLUTUS_BG_HOUR_SHARE` (default 0.5) of the hourly cap and `PLUTUS_BG_DAY_SHARE` (default 0.6) of
+the daily one. The rest is kept for what the operator does — a full pull, onboarding, a live
+campaign — which background work can never starve. When background work cannot afford its next
+step it logs **one line** saying when calls free up and pauses its GMGN work until then; the trade
+feed and trusted free pool prices carry on meanwhile.
+
+**Wallets are re-read on a slow rolling schedule.** Every 5 minutes the loop re-reads only the
+few stalest wallets, sized so each is re-read within `PLUTUS_RECONCILE_S` (default 12h). A wallet
+at zero with no fills since its last read is re-read at most daily. Full re-reads of every wallet
+happen only when the operator asks (full pull, onboarding).
+
+**The holder census comes first** and is never replaced by a partial one: a census the budget
+cuts short is discarded and the previous complete one stays current. The analysis page always
+states the census's coverage and age, and it and campaign advice warn when the latest census is
+partial.
+
+**Rate limits are handled once, for everyone.** A 429 pauses every worker in every process on the
+key, through the shared database, and the request is never repeated on the CLI.
+`PLUTUS_BALANCE_WORKERS` (default 4) sets how many balance reads run at once.
+
+**One full read per token at a time, across processes.** A CLI `tick --full` and the server's
+own full reads share a lock in the database, so they cannot read the same wallets twice.
+
+Measured by simulation with 458 wallets and no users: **~97 GMGN calls an hour** in steady state —
+36 for the hourly census, 48 for the rolling re-reads, 12 for the pool contract — with no wallet
+more than ~9.5h since a real read. Each token you track adds its own share. A token whose pool
+fails the free-source check reads its pool from GMGN, which adds up to ~30 an hour.

@@ -912,7 +912,13 @@ def _stop_tasks(token_id: int) -> int:
 
 
 def _inventory_busy(token_id: int) -> bool:
-    """Is a full read of this token's wallets already running (onboarding scan or full pull)?"""
+    """Is a full read of this token's wallets already running -- here, or in ANY process?
+
+    The cross-process lock is what stops a CLI `tick --full` and this server's sweep from reading
+    the same wallets at once; the in-memory checks cover the moments before it is taken.
+    """
+    if db.scan_lock_holder(token_id) is not None:
+        return True
     scan = _scans.get(token_id)
     if scan is not None and not scan.done():
         return True
@@ -936,7 +942,22 @@ async def _loop(token_id: int) -> None:
     whole web server -- every page, every viewer -- for the length of each call.
     """
     last_census = float(db.latest_census_ts(token_id) or 0)
-    last_inv = last_full_try = 0.0
+    last_inv = 0.0
+    paused_until = 0.0
+    said: dict[str, str] = {}
+
+    def once(key: str, msg: str) -> None:
+        """Log a condition when it CHANGES, not every minute it persists."""
+        if said.get(key) != msg:
+            said[key] = msg
+            log.warning(msg)
+
+    def pause(r) -> float:
+        log.warning("token %s: background GMGN budget is committed (%s) — pausing background "
+                    "GMGN work until %s. The trade feed and trusted free pool prices continue.",
+                    token_id, r.name, time.strftime("%H:%M", time.localtime(r.resume_at)))
+        return r.resume_at
+
     while True:
         # Belt and braces: even if a cancel is missed, a loop whose token has been deleted
         # exits instead of logging `unknown token N` on every cycle for the life of the process.
@@ -944,25 +965,45 @@ async def _loop(token_id: int) -> None:
             log.info("token %s no longer exists — stopping its tracker loop", token_id)
             return
         try:
-            for fn in (T.track_pool, T.track_tape):
-                r = await asyncio.to_thread(fn, token_id)
-                if not r.ok:
-                    log.warning("%s: %s", r.name, r.detail)
+            # Free every tick: the trade feed never touches the GMGN budget.
+            r = await asyncio.to_thread(T.track_tape, token_id)
+            if not r.ok:
+                once("tape", f"token {token_id} tape: {r.detail}")
             now = time.time()
+            if now < paused_until:
+                await asyncio.sleep(TICK_S)
+                continue
+            if paused_until:
+                log.info("token %s: background GMGN budget available again — resuming", token_id)
+                paused_until = 0.0
+
+            # EVERYTHING BELOW IS BACKGROUND WORK: it runs in the background tier, which stops at
+            # its own share of the budget so the operator's actions are never refused. A step it
+            # cannot afford sets ONE pause until slots free -- no per-wallet refusals, no retrying
+            # every five minutes against a spent cap.
+            r = await asyncio.to_thread(T.track_pool, token_id, background=True)
+            if not r.ok:
+                once("pool", f"token {token_id} pool: {r.detail}")
+
+            # The census goes first. Routine wallet re-reads never spend budget it needs.
             if now - last_census > CENSUS_S:
-                await asyncio.to_thread(T.track_census, token_id)
-                await asyncio.to_thread(T.track_pool, token_id, True)   # re-check the free source
+                r = await asyncio.to_thread(T.track_census, token_id, background=True)
+                if r.resume_at:
+                    paused_until = pause(r)
+                    await asyncio.sleep(TICK_S)
+                    continue
                 last_census = now
-            if not _inventory_busy(token_id):
-                st = db.stalest_balance_ts(token_id)
-                full_due = ((st is None or now - st > CENSUS_S)
-                            and now - last_full_try > INVENTORY_S)
-                if full_due:
-                    await asyncio.to_thread(T.track_inventory, token_id, True)
-                    last_full_try = last_inv = now
-                elif now - last_inv > INVENTORY_S:
-                    await asyncio.to_thread(T.track_inventory, token_id, False)
-                    last_inv = now
+                if r.ok:
+                    await asyncio.to_thread(T.track_pool, token_id, verify=True, background=True)
+
+            # Wallets: never-read ones, gap-affected ones, the pool contract, and a few of the
+            # stalest on a rolling schedule. Full re-reads of every wallet are operator actions.
+            if now - last_inv > INVENTORY_S and not _inventory_busy(token_id):
+                r = await asyncio.to_thread(T.track_inventory, token_id, background=True,
+                                            reconcile=INVENTORY_S)
+                last_inv = now
+                if r.resume_at:
+                    paused_until = pause(r)
         except Exception:                       # noqa: BLE001 — the loop never dies of one cycle
             log.exception("tracker cycle failed")
         await asyncio.sleep(TICK_S)

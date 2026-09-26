@@ -134,7 +134,7 @@ def test_a_feed_gap_flags_the_position_and_forces_a_re_read():
     from plutus.track import trackers as T
     from plutus.sources import gmgn
     read = []
-    gmgn.token_balance = lambda c, w, t, fresh=False: (read.append(w), (1.0, 1))[1]
+    gmgn.token_balance = lambda c, w, t, fresh=False, **k: (read.append(w), (1.0, 1))[1]
     T.clear_abort(tid)
     T.track_inventory(tid, full=False)
     assert {A, B} <= set(read), f"wallets read before the gap were not re-read: {read}"
@@ -149,7 +149,7 @@ def test_traded_wallets_are_no_longer_re_read_on_every_delta():
     from plutus.track import trackers as T
     from plutus.sources import gmgn
     read = []
-    gmgn.token_balance = lambda c, w, t, fresh=False: (read.append(w), (1.0, 1))[1]
+    gmgn.token_balance = lambda c, w, t, fresh=False, **k: (read.append(w), (1.0, 1))[1]
     T.clear_abort(tid)
     T.track_inventory(tid, full=False)
     assert not ({A, B, C} & set(read)), \

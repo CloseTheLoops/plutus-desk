@@ -182,6 +182,7 @@ def build(token_id: int) -> Ledger:
     if negative:
         notes.append(f"{len(negative)} of our wallets sold more than their last read held — "
                      f"tokens moved in from outside the tracked pool; shown as 0 until re-read")
+    notes.extend(census_notes(token_id))
     gap_ts = db.latest_tape_gap_ts(token_id)
     if gap_ts:
         behind = [a for a in ours_addrs if a in rows and rows[a][2] < gap_ts]
@@ -243,3 +244,32 @@ def build(token_id: int) -> Ledger:
         pool_venues=len(by_class.get("pool", [])),
         census_holders=holders, census_ts=census_ts, balance_ts=balance_ts, notes=notes,
     )
+
+
+# A census whose holder count falls this far below the best of the last day was cut short.
+CENSUS_PARTIAL_RATIO = 0.6
+
+
+def census_notes(token_id: int) -> list[str]:
+    """How complete and how recent the holder census behind these numbers is.
+
+    Always states age and coverage; warns (a note starting "CENSUS PARTIAL") when the latest
+    census returned fewer slices than a full one, or found far fewer holders than the best census
+    of the last day -- the 46-versus-132 case. Campaign advice carries that warning too.
+    """
+    from plutus.track.trackers import CENSUS_SLICES          # trackers never imports this module
+    m = db.latest_census_meta(token_id)
+    if m is None:
+        return ["CENSUS PARTIAL: no holder census yet — holder-based figures are not available"]
+    age_m = max(0, (db.now() - m["sweep_ts"]) // 60)
+    found, holders = m["rows_found"] or 0, m["holder_count"] or 0
+    cov = f"{found} of {holders} holders ({found / holders:.0%})" if holders else f"{found} holders"
+    out = [f"census: {cov}, {age_m // 60}h {age_m % 60}m old"]
+    best = max((r["rows_found"] or 0 for r in db.census_meta_since(token_id, db.now() - 86400)),
+               default=found)
+    if (m["slices"] or 0) < CENSUS_SLICES or (best and found < CENSUS_PARTIAL_RATIO * best):
+        out.append(f"CENSUS PARTIAL: the latest census found {found} holders where the best of "
+                   f"the last day found {best}, from {m['slices'] or 0} of {CENSUS_SLICES} "
+                   f"slices — float composition and any advice drawn from holders use a partial "
+                   f"view")
+    return out

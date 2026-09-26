@@ -64,16 +64,18 @@ class _Vendor:
             raise self.gmgn.BudgetExceeded("cap")
         self.calls += 1
 
-    def balance(self, chain, w, token, fresh=False):
+    def balance(self, chain, w, token, fresh=False, **k):
         self._spend()
         return 1000.0, 100
 
-    def pool(self, chain, address, fresh=False):
+    def pool(self, chain, address, fresh=False, **k):
         self._spend()
         return {"base_reserve": 140_000_000.0, "quote_reserve": 11_700.0, "liquidity": 23_400.0}
 
-    def budget(self):
-        return {"hour_left": self.cap - self.calls, "ok": self.calls < self.cap}
+    def budget(self, background=False, need=1):
+        left = self.cap - self.calls
+        return {"hour_left": left, "day_left": left, "left": left, "ok": left > 0,
+                "resumes_at": time.time() + 60}
 
 
 def _free_pool(agree=True):
@@ -134,7 +136,7 @@ def test_a_sweep_reads_what_the_budget_allows_most_important_first():
     from plutus.track import trackers as T
     v = _Vendor(gmgn, cap=T.BUDGET_RESERVE + 30)   # room for 30 reads after the reserve
     read = []
-    v.balance = lambda c, w, t, fresh=False: (read.append(w), v._spend(), (1.0, 1))[2]
+    v.balance = lambda c, w, t, fresh=False, **k: (read.append(w), v._spend(), (1.0, 1))[2]
     gmgn.token_balance = v.balance
     T.clear_abort(tid)
     r = T.track_inventory(tid, full=True)
@@ -162,7 +164,7 @@ def test_an_explicit_full_pull_bypasses_the_cache():
     v = _Vendor(gmgn)
     gmgn.balance_cached = lambda c, w, t: True
     seen = []
-    gmgn.token_balance = lambda c, w, t, fresh=False: (seen.append(fresh), (1.0, 1))[1]
+    gmgn.token_balance = lambda c, w, t, fresh=False, **k: (seen.append(fresh), (1.0, 1))[1]
     T.clear_abort(tid)
     T.track_inventory(tid, full=True, fresh=True)
     assert seen and all(seen), "a full pull the operator asked for was served from cache"

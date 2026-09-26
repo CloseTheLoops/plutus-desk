@@ -115,7 +115,7 @@ def test_a_deleted_token_stops_its_sweep_mid_flight():
         db.classify(tid, "0x%040x" % i, "ours", source="operator")
 
     calls = []
-    gmgn.token_balance = lambda c, w, t, fresh=False: (calls.append(w), time.sleep(0.05),
+    gmgn.token_balance = lambda c, w, t, fresh=False, **k: (calls.append(w), time.sleep(0.05),
                                                        (1.0, 1))[2]
     T.clear_abort(tid)
     threading.Thread(target=lambda: (time.sleep(0.3), T.abort(tid)), daemon=True).start()
@@ -130,7 +130,7 @@ def test_re_onboarding_a_deleted_token_costs_nothing_inside_the_ttl():
     """DELETE IS STILL GONE. The cache holds vendor answers, not the token."""
     gmgn, _ = _fresh(hour="500")
     real = []
-    gmgn._http_call = lambda args: (real.append(args), {"ok": True})[1]
+    gmgn._http_call = lambda args, **k: (real.append(args), {"ok": True})[1]
     args = ("token", "info", "--chain", "robinhood", "--address", "0x" + "a" * 40)
 
     gmgn.call(*args)
@@ -144,7 +144,7 @@ def test_re_onboarding_a_deleted_token_costs_nothing_inside_the_ttl():
 def test_an_explicit_pull_is_never_served_from_cache():
     gmgn, _ = _fresh(hour="500")
     real = []
-    gmgn._http_call = lambda args: (real.append(args), {"ok": True})[1]
+    gmgn._http_call = lambda args, **k: (real.append(args), {"ok": True})[1]
     args = ("portfolio", "token-balance", "--chain", "robinhood",
             "--wallet", "0x" + "b" * 40, "--token", "0x" + "a" * 40)
     gmgn.call(*args)

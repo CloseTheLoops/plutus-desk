@@ -133,6 +133,14 @@ CREATE TABLE IF NOT EXISTS pool_parity (
 -- not reach back to the newest fill already stored, fills in between were never seen. Balances
 -- rolled forward from fills cannot be trusted across such a gap, so it is recorded and the
 -- affected wallets are re-read.
+-- One full wallet read per token at a time, ACROSS PROCESSES. The web server and a CLI
+-- `tick --full` are separate processes; an in-memory flag in one cannot see the other, and two
+-- full reads of the same wallets is the same budget spent twice. `expires` lets a crashed
+-- holder's lock lapse instead of blocking forever.
+CREATE TABLE IF NOT EXISTS scan_lock (
+  token_id INTEGER PRIMARY KEY, owner TEXT NOT NULL, started INTEGER, expires INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS tape_gaps (
   token_id INTEGER NOT NULL, ts INTEGER NOT NULL,
   after_block INTEGER, before_block INTEGER,
@@ -274,7 +282,8 @@ def record_trades(rows: list[tuple]) -> int:
 # each delete -- a table added later and not listed here would quietly survive a wipe the
 # operator believes finished, which is the worst possible outcome for a delete button.
 TOKEN_KEYED = ("venues", "addresses", "calibration", "pool_obs", "trades", "balances",
-               "census", "census_meta", "ticks", "campaigns", "pool_parity", "tape_gaps")
+               "census", "census_meta", "ticks", "campaigns", "pool_parity", "tape_gaps",
+               "scan_lock")
 
 
 def delete_token(token_id: int) -> dict:
@@ -429,6 +438,75 @@ def stalest_balance_ts(token_id: int) -> int | None:
     # added later -- is picked up by the delta sweep; letting it make "stalest" None would make
     # a full re-read of every wallet due on every cycle.
     return min(seen) if seen else None
+
+
+SCAN_LOCK_TTL_S = 1800
+
+
+def _lock_conn() -> sqlite3.Connection:
+    """A short-lived autocommit connection for the lock, so BEGIN IMMEDIATE is always legal."""
+    c = sqlite3.connect(config.DB_PATH, timeout=10, isolation_level=None, check_same_thread=False)
+    c.row_factory = sqlite3.Row
+    c.execute("PRAGMA busy_timeout=10000")
+    c.execute("CREATE TABLE IF NOT EXISTS scan_lock (token_id INTEGER PRIMARY KEY, "
+              "owner TEXT NOT NULL, started INTEGER, expires INTEGER NOT NULL)")
+    return c
+
+
+def acquire_scan_lock(token_id: int, owner: str, ttl: int = SCAN_LOCK_TTL_S) -> dict | None:
+    """Take the full-read lock for a token. Returns None on success, else who holds it."""
+    c = _lock_conn()
+    try:
+        c.execute("BEGIN IMMEDIATE")
+        t = now()
+        row = c.execute("SELECT owner, started, expires FROM scan_lock WHERE token_id=?",
+                        (token_id,)).fetchone()
+        if row and row["expires"] > t and row["owner"] != owner:
+            c.execute("COMMIT")
+            return dict(row)
+        c.execute("INSERT OR REPLACE INTO scan_lock (token_id, owner, started, expires) "
+                  "VALUES (?,?,?,?)", (token_id, owner, t, t + ttl))
+        c.execute("COMMIT")
+        return None
+    finally:
+        c.close()
+
+
+def refresh_scan_lock(token_id: int, owner: str, ttl: int = SCAN_LOCK_TTL_S) -> None:
+    c = _lock_conn()
+    try:
+        c.execute("UPDATE scan_lock SET expires=? WHERE token_id=? AND owner=?",
+                  (now() + ttl, token_id, owner))
+    finally:
+        c.close()
+
+
+def release_scan_lock(token_id: int, owner: str) -> None:
+    c = _lock_conn()
+    try:
+        c.execute("DELETE FROM scan_lock WHERE token_id=? AND owner=?", (token_id, owner))
+    finally:
+        c.close()
+
+
+def scan_lock_holder(token_id: int) -> dict | None:
+    c = _lock_conn()
+    try:
+        row = c.execute("SELECT owner, started, expires FROM scan_lock WHERE token_id=? "
+                        "AND expires>?", (token_id, now())).fetchone()
+        return dict(row) if row else None
+    finally:
+        c.close()
+
+
+def latest_census_meta(token_id: int) -> sqlite3.Row | None:
+    return connect().execute("SELECT * FROM census_meta WHERE token_id=? ORDER BY sweep_ts DESC "
+                             "LIMIT 1", (token_id,)).fetchone()
+
+
+def census_meta_since(token_id: int, since: int) -> list[sqlite3.Row]:
+    return connect().execute("SELECT * FROM census_meta WHERE token_id=? AND sweep_ts>=? "
+                             "ORDER BY sweep_ts", (token_id, since)).fetchall()
 
 
 def latest_census_ts(token_id: int) -> int | None:
