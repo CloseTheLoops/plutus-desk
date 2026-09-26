@@ -10,6 +10,9 @@ because it takes several minutes:  PLUTUS_LONG_TESTS=1 python tests/test_fortnig
 """
 from __future__ import annotations
 
+import os as _os_rpc_guard
+_os_rpc_guard.environ["PLUTUS_RPC_DISABLE"] = "1"          # never a real chain node here
+
 import asyncio
 import heapq
 import itertools

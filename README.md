@@ -194,32 +194,43 @@ single point of failure.
 so the service and any CLI command coordinate automatically — but only if they use the same
 `data/` directory. Two checkouts with separate databases are two independent budgets.
 
-## Exact balances from the transfer ledger (Etherscan)
+## Exact balances from the transfer ledger (free, no key)
 
-With an Etherscan API key, Plutus keeps the token's **complete transfer history** (every ERC-20
-`Transfer` event, via `getLogs`) and derives every address's balance from it, exactly, as
-integers. That covers what per-wallet reads miss between reads: transfers between your own
-wallets, staking, other venues, and every holder the GMGN census never ranks. The ledger is
-checked against the token's total supply hourly and rebuilt if it ever disagrees. While it is
-synced (within 15 minutes) and verified, per-wallet GMGN balance reads stop entirely; GMGN is kept
-for what only it has — cost basis, PnL, tags, and pool checks. If the ledger falls behind, the desk
-falls back to GMGN reads on its own.
+Plutus keeps the token's **complete transfer history** (every ERC-20 `Transfer` event) and
+derives every address's balance from it, exactly, as integers. That covers what per-wallet reads
+miss between reads: transfers between your own wallets, staking, other venues, and every holder
+the GMGN census never ranks. The ledger is checked against the token's total supply hourly — read
+at the very block the ledger synced to — and rebuilt if it ever disagrees. While it is synced
+(within 15 minutes) and verified (within 6 hours), per-wallet GMGN balance reads stop entirely;
+GMGN is kept for what only it has — cost basis, PnL, tags, and pool checks. If the ledger falls
+behind, the desk falls back to GMGN reads on its own.
 
-**Key:** put it on one line in `data/etherscan.key` (gitignored), or set `PLUTUS_ETHERSCAN_KEY`.
-Never commit it or paste it anywhere shared. `python -m plutus.cli doctor <token>` checks the key,
-the chain on your plan, and that the ledger sums to supply — without printing the key.
+**Source: the chain's own public RPC, free, no key.** On Robinhood chain that is
+`rpc.mainnet.chain.robinhood.com`. Measured 2026-09-26 on FAITH: the full history from the mint
+rebuilt from it matched total supply to the last unit, and every holder checked matched the
+token's own `balanceOf`. What the public node does, and how the reader copes (re-verify monthly):
 
-**Limits** (researched 2026-09-26 — re-verify monthly):
+| Node behaviour | Handling |
+|---|---|
+| ≤10,000 logs per query; wide busy ranges time out | ranges halve on refusal, widen when pages are small |
+| blocks past its head come back as an empty list, not an error | never asks a node beyond its own head; syncs 100 blocks (10s) behind |
+| state kept for ~1,000 blocks only | supply read at the synced block, right after syncing |
+| logs carry no timestamp (`0x0`) | block times fetched in batches of 50 |
+| no published rate limit ("not for production") | ~4 calls a minute needed; all processes paced together at `PLUTUS_RPC_RPS` (default 4) |
 
-| Plan | Price | Rate | Daily | Robinhood chain |
-|---|---|---|---|---|
-| Free | $0 | 3/s | 100,000 | until 2026-10-15 only |
-| Lite | $49/mo | 5/s | 100,000 | required from 2026-10-16 |
+Add or replace endpoints with `PLUTUS_RPC_<CHAIN>=url1,url2` (e.g. a free Alchemy URL); a
+second endpoint is only used for blocks it has itself reached. Only Robinhood has a default;
+other chains need an endpoint set this way, or an Etherscan key.
 
-Measured by a simulated week: **~4,300 Etherscan calls a day per token** (a sync every 30s plus
-the hourly supply check), and GMGN falls from ~110 calls an hour to ~1. Settings:
-`PLUTUS_ETHERSCAN_RPS` (default 2.5; raise to 4.5 on Lite), `PLUTUS_ETHERSCAN_DAILY` (default
-90,000). All processes share one pacer through the database.
+**Etherscan is optional** — used only where no RPC is configured, with a key in
+`data/etherscan.key` (gitignored) or `PLUTUS_ETHERSCAN_KEY`. `PLUTUS_LEDGER_SOURCE=etherscan|rpc`
+forces one. Etherscan's Robinhood-chain access needs the Lite plan ($49/mo) from 2026-10-16.
+Rejected free alternatives (2026-09-26): dRPC's keyless tier (refused 1,000-block ranges, no
+state at a block), Blockscout (Cloudflare challenge on scripted requests).
+
+`python -m plutus.cli doctor <token>` shows the source, the syncable head, and whether the ledger
+sums to supply. `PLUTUS_LIVE_TESTS=1 python tests/test_live_ledger.py` rebuilds FAITH's ledger
+from the live node into a scratch database and checks holders against `balanceOf`.
 
 GeckoTerminal (free trade feed and trusted pool prices, 30 calls/min public) is likewise paced
 across every process through the database, at one call per 2.1s, and a 429 pauses every caller.

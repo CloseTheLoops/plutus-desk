@@ -49,7 +49,7 @@ POOL_S = 60          # pool
 # outruns it -- a 458-wallet buy wave did, costing a re-read of every wallet. Polling the free
 # feed faster during a burst keeps up at no GMGN cost.
 TAPE_FAST_S = 10
-# With a transfer ledger: how often it syncs (Etherscan, not GMGN), how long to wait before
+# With a transfer ledger: how often it syncs (free chain RPC or Etherscan, not GMGN), how long to wait before
 # retrying one that failed, and how often the GMGN holder census -- now only for TAGS, since the
 # ledger already has every holder -- runs.
 LEDGER_S = 30
@@ -960,7 +960,7 @@ async def _onboard_scan(token_id: int) -> None:
         st["done"], st["of"] = done, of
 
     try:
-        from plutus.sources import etherscan as _E
+        from plutus.sources import transfers as _E
         t = db.token_row(token_id)
         r = None
         if t is not None and _E.available(t["chain"]):
@@ -1020,7 +1020,7 @@ def _stop_tasks(token_id: int) -> int:
 
 
 def _ledger_ok(token_id: int) -> bool:
-    from plutus.sources import etherscan as _E
+    from plutus.sources import transfers as _E
     t = db.token_row(token_id)
     return t is not None and _E.available(t["chain"])
 
@@ -1058,7 +1058,7 @@ async def _loop(token_id: int) -> None:
     last_census = float(db.latest_census_ts(token_id) or 0)
     last_inv = last_pool = last_ledger = ledger_retry_at = 0.0
     paused_until = 0.0
-    from plutus.sources import etherscan as _E
+    from plutus.sources import transfers as _E
     chain = (db.token_row(token_id) or {"chain": ""})["chain"]
     said: dict[str, str] = {}
 
@@ -1095,7 +1095,7 @@ async def _loop(token_id: int) -> None:
             burst = bool(r.ok and r.done and r.done >= T.gecko.TRADES_WINDOW // 2)
             now = time.time()
 
-            # The transfer ledger is Etherscan, not GMGN: it keeps syncing while GMGN background
+            # The transfer ledger is not GMGN (chain RPC or Etherscan): it keeps syncing while GMGN background
             # work is paused. A failure falls back to per-wallet reads and retries later.
             if (chain and _E.available(chain) and now >= ledger_retry_at
                     and now - last_ledger >= LEDGER_S):

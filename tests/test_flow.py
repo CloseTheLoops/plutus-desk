@@ -5,6 +5,9 @@ kind, because nothing errors and the figure is simply believed.
 """
 from __future__ import annotations
 
+import os as _os_rpc_guard
+_os_rpc_guard.environ["PLUTUS_RPC_DISABLE"] = "1"          # never a real chain node here
+
 import sys
 import tempfile
 from pathlib import Path

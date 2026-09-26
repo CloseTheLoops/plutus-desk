@@ -646,12 +646,15 @@ def apply_transfers(token_id: int, logs: list[dict], decimals: int, synced_block
 # Otherwise the desk falls back to per-wallet reads, so an Etherscan outage or a lapsed plan
 # degrades accuracy instead of freezing the numbers.
 LEDGER_FRESH_S = 900
+# Exact only while supply checks keep passing: a check that cannot run for this long ends it.
+LEDGER_VERIFIED_S = 6 * 3600
 
 
 def ledger_healthy(token_id: int) -> bool:
     st = ledger_state(token_id)
     return bool(st and st["verified_ok"] == 1 and st["synced_ts"]
-                and now() - st["synced_ts"] <= LEDGER_FRESH_S)
+                and now() - st["synced_ts"] <= LEDGER_FRESH_S
+                and st["verified_ts"] and now() - st["verified_ts"] <= LEDGER_VERIFIED_S)
 
 
 def set_ledger_verified(token_id: int, ok: bool) -> None:

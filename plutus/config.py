@@ -52,12 +52,20 @@ class ChainProfile:
     addr_lower: bool          # EVM: normalize to lowercase. Solana: never.
     native_symbol: str
     verified: bool            # have we actually run the full pipeline here?
-    etherscan_chain: int | None = None   # Etherscan v2 chain id; None = no transfer ledger
+    etherscan_chain: int | None = None   # Etherscan v2 chain id (optional, paid on some chains)
+    # Free JSON-RPC for the transfer ledger. Only endpoints MEASURED to serve the full history
+    # are listed; add others per deployment with PLUTUS_RPC_<CHAIN>=url1,url2.
+    rpc_urls: tuple[str, ...] = ()
+    confirm_blocks: int = 12              # sync this far behind the head (reorg / lagging nodes)
+    time_anchor_blocks: int = 300         # backfill block times: one exact fetch per this many
 
 
 CHAINS: dict[str, ChainProfile] = {
     "robinhood": ChainProfile("robinhood", "robinhood", True, "ETH", verified=True,
-                              etherscan_chain=4663),
+                              etherscan_chain=4663,
+                              rpc_urls=("https://rpc.mainnet.chain.robinhood.com",),
+                              confirm_blocks=100,       # 0.1s blocks: 10 seconds
+                              time_anchor_blocks=36_000),  # one an hour: measured error <= 1s
     "bsc": ChainProfile("bsc", "bsc", True, "BNB", verified=False, etherscan_chain=56),
     "base": ChainProfile("base", "base", True, "ETH", verified=False, etherscan_chain=8453),
     "eth": ChainProfile("eth", "eth", True, "ETH", verified=False, etherscan_chain=1),

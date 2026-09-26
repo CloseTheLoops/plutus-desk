@@ -6,6 +6,9 @@ prove nothing; checking it against what the venue actually paid is the only test
 """
 from __future__ import annotations
 
+import os as _os_rpc_guard
+_os_rpc_guard.environ["PLUTUS_RPC_DISABLE"] = "1"          # never a real chain node here
+
 import math
 import sys
 from pathlib import Path

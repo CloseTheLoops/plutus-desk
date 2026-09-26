@@ -183,7 +183,7 @@ def cmd_doctor(a) -> None:
         print(f"  {'PASS' if ok else 'FAIL'}  {label}" + (f"  —  {detail}" if detail else ""))
         return ok
 
-    _doctor_etherscan(a, line)
+    _doctor_ledger(a, line)
 
     print()
     print("gmgn credentials")
@@ -285,42 +285,33 @@ def cmd_doctor(a) -> None:
     print()
 
 
-def _doctor_etherscan(a, line) -> None:
-    """The transfer ledger's source: key, chain on this plan, and -- per token -- exactness.
-
-    Four calls at most. Never prints the key itself, only where it was found.
-    """
+def _doctor_ledger(a, line) -> None:
+    """The transfer ledger's source (free chain RPC, else Etherscan) and -- per token -- whether
+    it is exact. A handful of calls. Never prints a key, only where it was found."""
     import os
 
-    from plutus.sources import etherscan as es
+    from plutus.sources import chainrpc, etherscan as es, transfers
 
     print()
-    print("etherscan (transfer ledger)")
+    print("transfer ledger (exact balances)")
+    eps = chainrpc.endpoints(a.chain)
     key = es.api_key()
-    where = next((n for n in ("PLUTUS_ETHERSCAN_KEY", "ETHERSCAN_API_KEY")
-                  if (os.environ.get(n) or "").strip()), "data/etherscan.key")
-    if not key:
-        line(False, "api key", "none — balances fall back to per-wallet GMGN reads. Put the key "
-             "on one line in data/etherscan.key (gitignored) or set PLUTUS_ETHERSCAN_KEY")
-        return
-    line(True, "api key", f"from {where} ({len(key)} chars)")
-    cid = config.chain(a.chain).etherscan_chain
-    if cid is None:
-        line(False, "chain supported", f"{a.chain} has no Etherscan chain id in config")
+    line(bool(eps), "free chain RPC", ", ".join(e.host for e in eps) if eps else
+         f"none configured for {a.chain} (set PLUTUS_RPC_{a.chain.upper()}=<url>)")
+    if key:
+        where = next((n for n in ("PLUTUS_ETHERSCAN_KEY", "ETHERSCAN_API_KEY")
+                      if (os.environ.get(n) or "").strip()), "data/etherscan.key")
+        print(f"        etherscan key present ({where}) — used only where no RPC is configured")
+    src = transfers.for_chain(a.chain)
+    if src is None:
+        line(False, "source", "no RPC and no Etherscan key — balances use per-wallet GMGN reads")
         return
     try:
-        head = es.latest_block(cid)
-        line(True, "chain on this plan", f"{a.chain} (chainid {cid}) head block {head:,}")
-    except es.PlanRequired as exc:
-        line(False, "chain on this plan", str(exc)[:200])
+        head = src.latest_block()
+        line(True, "source answers", f"{src.name} · syncable head block {head:,}")
+    except transfers.LedgerSourceError as exc:
+        line(False, "source answers", f"{src.name}: {str(exc)[:160]}")
         return
-    except es.EtherscanError as exc:
-        line(False, "chain on this plan", str(exc)[:160])
-        return
-    b = es.budget()
-    if b.get("day") is not None:
-        line(b["day"] < b["day_cap"], "daily budget", f"{b['day']:,}/{b['day_cap']:,} today "
-             f"· paced at {es.RPS}/s")
     if not a.token:
         return
     try:
@@ -329,17 +320,27 @@ def _doctor_etherscan(a, line) -> None:
         return
     st = db.ledger_state(tid)
     if not st:
-        line(False, "ledger built", "not yet — the server builds it on its next pass, or run "
-             f"a full pull for {a.token}")
+        line(False, "ledger built", "not yet — the server builds it on its next pass "
+             f"(or: python -m plutus.cli tick {a.token} --full)")
         return
-    supply = es.token_supply(cid, cfg.address)
+    try:
+        supply = src.token_supply(cfg.address, st["synced_block"])
+    except transfers.LedgerSourceError:
+        supply = None                                   # that block's state is gone; use latest
+    if supply is None:
+        try:
+            supply = src.token_supply(cfg.address)
+        except transfers.LedgerSourceError as exc:
+            line(False, "ledger sums to supply", f"supply unreadable: {str(exc)[:120]}")
+            return
     held = db.holdings_sum_raw(tid)
     line(held == supply, "ledger sums to supply",
          f"{len(db.holdings(tid)):,} holders · synced to block {st['synced_block']:,}"
-         + ("" if held == supply else f" · off by {supply - held} raw units (rebuild due)"))
-    line(db.ledger_healthy(tid), "exact mode",
-         "on — balances are exact" if db.ledger_healthy(tid) else
-         "off — not synced in the last 15 min or not yet verified; GMGN reads cover meanwhile")
+         + ("" if held == supply else f" · off by {supply - held} raw units (a transfer may "
+            "have landed since the sync; if this persists the server rebuilds it)"))
+    healthy = db.ledger_healthy(tid)
+    line(healthy, "exact mode", "on — balances are exact" if healthy else
+         "off — not synced in the last 15 min or not verified recently; GMGN reads cover meanwhile")
 
 
 def main() -> None:
