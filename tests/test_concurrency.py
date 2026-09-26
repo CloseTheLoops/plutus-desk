@@ -21,6 +21,17 @@ from concurrent.futures import ThreadPoolExecutor
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
+# NEVER THE PRODUCTION DATABASE. These tests spend pacer slots; pointed at the server's own
+# database they read its real budget and failed whenever that was spent -- for a reason that
+# has nothing to do with the code under test.
+import os as _os  # noqa: E402
+import tempfile as _tf  # noqa: E402
+_os.environ["PLUTUS_DB"] = str(pathlib.Path(_tf.gettempdir()) / f"plutus_conc_{_os.getpid()}.db")
+_os.environ.setdefault("PLUTUS_MAX_CALLS_HOUR", "1000000")
+_os.environ.setdefault("PLUTUS_MAX_CALLS_DAY", "10000000")
+
+from plutus import config  # noqa: E402
+config.DB_PATH = pathlib.Path(_os.environ["PLUTUS_DB"])
 from plutus.sources import gmgn  # noqa: E402
 from plutus.track import trackers  # noqa: E402
 

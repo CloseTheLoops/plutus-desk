@@ -24,6 +24,15 @@ from plutus.sources import gmgn  # noqa: E402
 
 CHAIN = "robinhood"
 
+# LIVE TESTS ARE OPT-IN. These call the real API on the real key, so they spend real budget and
+# fail whenever it is spent. Run them deliberately: PLUTUS_LIVE_TESTS=1 python tests/...
+# Against a temporary database either way, so they never read the server's own budget.
+import os as _os  # noqa: E402
+import tempfile as _tf  # noqa: E402
+LIVE = _os.environ.get("PLUTUS_LIVE_TESTS", "").strip() in ("1", "true", "yes")
+from plutus import config as _config  # noqa: E402
+_config.DB_PATH = pathlib.Path(_tf.gettempdir()) / f"plutus_parity_{_os.getpid()}.db"
+
 
 def _shape(x, depth=0):
     """Keys and types, not values — live numbers move between two calls."""
@@ -85,6 +94,8 @@ def _cli_available() -> bool:
 
 
 def test_parity_across_every_route():
+    if not LIVE:
+        print("  live test — skipped (set PLUTUS_LIVE_TESTS=1 to run)"); return
     if not gmgn._api_key():
         print("  no API key — skipping"); return
     if not _cli_available():
@@ -108,6 +119,8 @@ def test_parity_across_every_route():
 
 def test_balance_values_agree_not_just_shapes():
     """Shape parity is not enough — the number itself has to match."""
+    if not LIVE:
+        print("  live test — skipped (set PLUTUS_LIVE_TESTS=1 to run)"); return
     if not gmgn._api_key() or not _cli_available():
         print("  no API key or no gmgn-cli — skipping"); return
     tok = _pick_token()

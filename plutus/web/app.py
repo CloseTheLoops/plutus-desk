@@ -38,7 +38,17 @@ app = FastAPI(title="Plutus — analysis")
 _env = Environment(loader=FileSystemLoader(Path(__file__).parent / "templates"),
                    autoescape=select_autoescape(["html"]))
 
-TICK_S = 60          # pool + tape
+# The loop's heartbeat is the TRADE FEED, which is free. It holds only the last few hundred fills,
+# so a coordinated buy wave can outrun a minute-apart poll before the fast-poll rule below even
+# sees it -- a 458-wallet wave in 90 seconds did, forcing a re-read of every wallet. Every 20s it
+# cannot. The pool, which may cost a GMGN call, keeps a one-minute cadence.
+TICK_S = 20          # tape
+POOL_S = 60          # pool
+# When the trade feed returns half a window or more of NEW fills, the next poll comes this soon.
+# The feed holds only the last few hundred fills, so a burst between two minute-apart polls
+# outruns it -- a 458-wallet buy wave did, costing a re-read of every wallet. Polling the free
+# feed faster during a burst keeps up at no GMGN cost.
+TAPE_FAST_S = 10
 INVENTORY_S = 300    # delta inventory
 CENSUS_S = 3600      # full census + full inventory reconciliation
 
@@ -257,9 +267,58 @@ async def api_onboard(request: Request, payload: dict = Body(...)) -> JSONRespon
     wallets = _parse_addresses(chain, payload.get("wallets", ""))
     excluded, problems = _parse_excluded(chain, payload.get("excluded", ""))
 
+    # Refuse a concurrent run BEFORE touching any file. Checked after the writes, a refused
+    # second click had already rewritten the operator's wallet list.
+    ident = (chain, address.lower())
+    if ident in _onboarding:
+        return JSONResponse(
+            {"error": "discovery for this token is already running — wait for it to finish "
+                      "rather than starting a second scan"}, status_code=409)
+    _onboarding.add(ident)
+    try:
+        return await _onboard_locked(chain, address, label, wallets, excluded, problems)
+    finally:
+        _onboarding.discard(ident)
+
+
+def _rollback_new_token(chain: str, address: str) -> None:
+    """Remove a token this onboarding created and could not finish. It never existed before."""
+    row = db.find_token(chain, address)
+    if row is None:
+        return
+    T.abort(row["id"])
+    _stop_tasks(row["id"])
+    _scan_state.pop(row["id"], None)
+    db.delete_token(row["id"])
+    log.warning("onboarding of %s did not complete — removed the half-created token", address[:12])
+
+
+async def _onboard_locked(chain, address, label, wallets, excluded, problems) -> JSONResponse:
+    from plutus import onboard
+
+    # MERGE, NEVER REPLACE. Resubmitting the form rewrote the wallet file wholesale and dropped a
+    # wallet added to it by hand -- which then read as FLOAT, overstating the float and
+    # understating our position. The form now only ADDS; removing a wallet is deliberate, done
+    # by editing the file. Excluded addresses and declared pools merge the same way.
     wf = config.BASE_DIR / "wallets" / f"{label}.txt"
     wf.parent.mkdir(exist_ok=True)
-    wf.write_text(chr(10).join(wallets) + (chr(10) if wallets else ""), encoding="utf-8")
+    existing = _parse_addresses(chain, wf.read_text(encoding="utf-8")) if wf.exists() else []
+    on_file = set(existing)
+    added = [w for w in wallets if w not in on_file]
+    merged = list(dict.fromkeys(existing + wallets))
+    wf.write_text(chr(10).join(merged) + (chr(10) if merged else ""), encoding="utf-8")
+    merge_notes = [f"wallets: {len(added)} added, {len(wallets) - len(added)} already on file, "
+                   f"{len(merged)} in total — the form never removes one; to remove a wallet, "
+                   f"edit wallets/{label}.txt"] if existing else []
+    prev_pools: list[str] = []
+    tf = config.TOKENS_DIR / f"{label}.toml"
+    if tf.exists():
+        try:
+            prev = config.load_token(label)
+            excluded = {**prev.excluded, **excluded}
+            prev_pools = list(prev.pools)
+        except Exception as exc:                          # noqa: BLE001 — a bad old file is replaced
+            log.warning("could not read existing %s (%s); writing a fresh one", tf.name, exc)
 
     lines = ["# written by the web onboarding form", "", "[token]",
              f'chain   = "{chain}"', f'address = "{address}"', f'label   = "{label}"', "",
@@ -268,29 +327,35 @@ async def api_onboard(request: Request, payload: dict = Body(...)) -> JSONRespon
         lines.append("[excluded]")
         lines += [f'"{a}" = "{c}"' for a, c in excluded.items()]
         lines.append("")
-    lines += ["[venues]", "pools = []", ""]
+    lines += ["[venues]", "pools = [" + ", ".join(f'"{p}"' for p in prev_pools) + "]", ""]
     (config.TOKENS_DIR / f"{label}.toml").write_text(chr(10).join(lines), encoding="utf-8")
 
     cfg = config.load_token(label)
-    # Discovery is a slow multi-call operation and the button is clickable throughout it. Two
-    # concurrent runs for the same token duplicate every discovery call and interleave their
-    # writes. Refuse the second rather than queue it: the caller wants the result of the one
-    # already in flight, not a second copy of it.
-    ident = (chain, address.lower())
-    if ident in _onboarding:
-        return JSONResponse(
-            {"error": "discovery for this token is already running — wait for it to finish "
-                      "rather than starting a second scan"}, status_code=409)
-    _onboarding.add(ident)
+    # A discovery that fails -- the budget refused it, the vendor was down -- used to leave the
+    # token row it had started: no symbol, no supply, nothing classified, shown on the site as a
+    # nameless token. A NEW token is rolled back completely; a token that existed before keeps
+    # its previous name and supply rather than having them overwritten with blanks.
+    before = db.find_token(chain, address)
+    old = dict(before) if before is not None else None
     try:
         d = await asyncio.to_thread(onboard.discover, cfg)
     except Exception as exc:  # noqa: BLE001 — surface the real reason to the form
         log.exception("onboarding failed for %s", address[:12])
-        return JSONResponse({"error": f"discovery failed: {exc}"}, status_code=500)
-    finally:
-        _onboarding.discard(ident)
+        if old is None:
+            _rollback_new_token(chain, address)
+        return JSONResponse({"error": f"discovery failed: {exc} — nothing was saved, so it is "
+                                      f"safe to try again"}, status_code=500)
+    if not d.symbol or not d.supply_nominal:
+        if old is None:
+            _rollback_new_token(chain, address)
+        else:
+            db.upsert_token(chain, address, symbol=old.get("symbol"),
+                            supply_nominal=old.get("supply_nominal"))
+        return JSONResponse({"error": "discovery came back without the token's name or supply "
+                                      "(usually the API budget refusing it) — nothing was saved, "
+                                      "try again once calls free up"}, status_code=502)
 
-    notes = list(d.notes)
+    notes = merge_notes + list(d.notes)
     if problems:
         notes.append(f"{len(problems)} line(s) in the excluded box could not be read and were "
                      f"skipped: {problems[0]}…")
@@ -546,8 +611,21 @@ async def api_refresh(request: Request, token_id: int = 1, full: bool = False) -
         return JSONResponse({"running": False, "kind": "quick",
                              "results": [vars(r) for r in res], "finished": db.now()})
 
+    # Say what the pull will cost BEFORE it runs, and when it will be complete if the budget
+    # cannot cover it now -- rather than letting the operator discover it as "FAILED".
+    from plutus.sources import gmgn as _g
+    t = db.token_row(token_id)
+    n = sum(1 for a, c in db.class_map(token_id).items()
+            if c in ("ours", "pool", "burnt", "locked", "unknown") and config.is_address(t["chain"], a))
+    need = n + T.CENSUS_SLICES + 2
+    b = _g.budget()
+    avail = max(0, (b.get("left") or 0) - T.BUDGET_RESERVE) if b.get("left") is not None else need
+    queued = max(0, need - avail)
+    estimate = {"calls": need, "available": avail, "now": min(need, avail), "queued": queued,
+                "completes_at": (_g.budget(background=True, need=queued).get("resumes_at")
+                                 if queued else db.now())}
     _jobs[token_id] = {"running": True, "kind": "full", "stage": "starting",
-                       "started": db.now(), "results": []}
+                       "started": db.now(), "results": [], "estimate": estimate}
 
     async def run() -> None:
         j = _jobs[token_id]
@@ -575,7 +653,7 @@ async def api_refresh(request: Request, token_id: int = 1, full: bool = False) -
 
     asyncio.create_task(run())
     return JSONResponse({"running": True, "kind": "full", "stage": "starting",
-                         "started": db.now()})
+                         "started": db.now(), "estimate": estimate})
 
 
 @app.get("/api/refresh")
@@ -873,6 +951,17 @@ async def _onboard_scan(token_id: int) -> None:
     try:
         r = await asyncio.to_thread(T.track_inventory, token_id, True, 3600, progress)
         st.update(ok=r.ok, detail=r.detail)
+        # The first pool check and the first census belong to ONBOARDING, which the operator
+        # asked for -- not to the background loop. Left to the loop, a 458-wallet onboarding had
+        # already used more than the background tier's share of the hour, so the loop's pool
+        # check was refused and the token had NO pool price for up to an hour, and no census
+        # for the worksheet to review.
+        st["stage"] = "pool"
+        await asyncio.to_thread(T.track_pool, token_id, True)
+        st["stage"] = "census"
+        c = await asyncio.to_thread(T.track_census, token_id)
+        if not c.ok:
+            st["detail"] = (st.get("detail") or "") + f" · census: {c.detail}"
     except asyncio.CancelledError:
         st.update(ok=False, detail="cancelled — the token was deleted")
         raise
@@ -942,7 +1031,7 @@ async def _loop(token_id: int) -> None:
     whole web server -- every page, every viewer -- for the length of each call.
     """
     last_census = float(db.latest_census_ts(token_id) or 0)
-    last_inv = 0.0
+    last_inv = last_pool = 0.0
     paused_until = 0.0
     said: dict[str, str] = {}
 
@@ -952,10 +1041,17 @@ async def _loop(token_id: int) -> None:
             said[key] = msg
             log.warning(msg)
 
+    last_pause_log = [0.0]
+
     def pause(r) -> float:
-        log.warning("token %s: background GMGN budget is committed (%s) — pausing background "
-                    "GMGN work until %s. The trade feed and trusted free pool prices continue.",
-                    token_id, r.name, time.strftime("%H:%M", time.localtime(r.resume_at)))
+        # Once per stretch of pausing, not every time a pause is re-entered: under sustained
+        # pressure from another process on the key the old code logged it dozens of times a day.
+        if time.time() - last_pause_log[0] > 3 * 3600:
+            log.warning("token %s: background GMGN budget is committed (%s) — pausing "
+                        "background GMGN work until %s. The trade feed and trusted free pool "
+                        "prices continue.", token_id, r.name,
+                        time.strftime("%H:%M", time.localtime(r.resume_at)))
+        last_pause_log[0] = time.time()
         return r.resume_at
 
     while True:
@@ -969,9 +1065,10 @@ async def _loop(token_id: int) -> None:
             r = await asyncio.to_thread(T.track_tape, token_id)
             if not r.ok:
                 once("tape", f"token {token_id} tape: {r.detail}")
+            burst = bool(r.ok and r.done and r.done >= T.gecko.TRADES_WINDOW // 2)
             now = time.time()
             if now < paused_until:
-                await asyncio.sleep(TICK_S)
+                await asyncio.sleep(TAPE_FAST_S if burst else TICK_S)
                 continue
             if paused_until:
                 log.info("token %s: background GMGN budget available again — resuming", token_id)
@@ -981,9 +1078,11 @@ async def _loop(token_id: int) -> None:
             # its own share of the budget so the operator's actions are never refused. A step it
             # cannot afford sets ONE pause until slots free -- no per-wallet refusals, no retrying
             # every five minutes against a spent cap.
-            r = await asyncio.to_thread(T.track_pool, token_id, background=True)
-            if not r.ok:
-                once("pool", f"token {token_id} pool: {r.detail}")
+            if now - last_pool >= POOL_S:
+                last_pool = now
+                r = await asyncio.to_thread(T.track_pool, token_id, background=True)
+                if not r.ok:
+                    once("pool", f"token {token_id} pool: {r.detail}")
 
             # The census goes first. Routine wallet re-reads never spend budget it needs.
             if now - last_census > CENSUS_S:
@@ -995,6 +1094,10 @@ async def _loop(token_id: int) -> None:
                 last_census = now
                 if r.ok:
                     await asyncio.to_thread(T.track_pool, token_id, verify=True, background=True)
+                removed = await asyncio.to_thread(db.prune, token_id)
+                if sum(removed.values()):
+                    log.info("token %s: pruned history nothing reads: %s", token_id,
+                             ", ".join(f"{k} {v}" for k, v in removed.items() if v))
 
             # Wallets: never-read ones, gap-affected ones, the pool contract, and a few of the
             # stalest on a rolling schedule. Full re-reads of every wallet are operator actions.
@@ -1004,6 +1107,9 @@ async def _loop(token_id: int) -> None:
                 last_inv = now
                 if r.resume_at:
                     paused_until = pause(r)
+            if burst:
+                await asyncio.sleep(TAPE_FAST_S)
+                continue
         except Exception:                       # noqa: BLE001 — the loop never dies of one cycle
             log.exception("tracker cycle failed")
         await asyncio.sleep(TICK_S)

@@ -244,18 +244,34 @@ def test_a_spent_budget_ends_the_sweep_without_a_line_per_wallet():
 
 
 # ── 1 + 4. rolling reconciliation, and idle zero wallets wait a day ─────────────────
-def test_one_step_reads_only_the_few_stalest():
+def test_one_step_reads_a_few_not_the_whole_set():
     db, gmgn, T, tid, wallets, clock = _fresh_db(n_ours=458)
     v = Vendor(gmgn, clock)
     db.record_balances(tid, [(w, 1000.0, 100) for w in wallets + [POOL]])
     clock[0] += 3600
     T.track_inventory(tid, background=True, reconcile=300)
-    assert len(v.stamps) == 1, f"an hour after a full read only the pool is due, read {len(v.stamps)}"
-    clock[0] += 6 * 3600
-    v.stamps.clear()
-    T.track_inventory(tid, background=True, reconcile=300)
-    n = math.ceil(458 * 300 / T.RECONCILE_S)
-    assert len(v.stamps) == 1 + n, f"expected the pool + {n} stalest, read {len(v.stamps)}"
+    assert 1 < len(v.stamps) <= 1 + 8, (
+        f"one step read {len(v.stamps)} wallets — it should read the pool and a handful")
+
+
+def test_every_deadline_is_met_at_the_minimum_rate_even_after_a_cohort():
+    """The 15-hour wallets: every wallet read in the same hour must not all come due together."""
+    db, gmgn, T, tid, wallets, clock = _fresh_db(n_ours=458)
+    v = Vendor(gmgn, clock)
+    db.record_balances(tid, [(w, 1000.0, 100) for w in wallets + [POOL]])   # one cohort
+    worst = 0.0
+    steps = 36 * 12                                                         # 36h of 5-min steps
+    for _ in range(steps):
+        clock[0] += 300
+        T.track_inventory(tid, background=True, reconcile=300)
+        rows = db.latest_balance_rows(tid)
+        worst = max(worst, max(clock[0] - rows[w][2] for w in wallets))
+    wallet_reads = len(v.stamps) - steps                                    # minus the pool
+    assert worst <= T.RECONCILE_S + 300, (
+        f"a wallet reached {worst / 3600:.1f}h without a read (limit {T.RECONCILE_S / 3600:.0f}h)")
+    minimum = 458 * 36 / (T.RECONCILE_S / 3600)
+    assert wallet_reads <= minimum * 1.35, (
+        f"{wallet_reads} wallet reads in 36h against a minimum of ~{minimum:.0f}")
 
 
 def test_idle_zero_wallets_are_re_read_at_most_daily():
@@ -268,11 +284,11 @@ def test_idle_zero_wallets_are_re_read_at_most_daily():
                        "t", 150)])
     rows = db.latest_balance_rows(tid)
     clock[0] += 13 * 3600
-    got = set(T._reconcile_pick(tid, [zero, held, traded], rows, T.RECONCILE_S))
+    got = set(T._reconcile_pick(tid, [zero, held, traded], rows, 300))
     assert zero not in got, "an idle zero wallet was re-read after 13h"
     assert {held, traded} <= got, "a funded wallet, or a zero wallet that has traded, was skipped"
     clock[0] += 12 * 3600
-    assert zero in set(T._reconcile_pick(tid, [zero, held, traded], rows, T.RECONCILE_S)), \
+    assert zero in set(T._reconcile_pick(tid, [zero, held, traded], rows, 300)), \
         "an idle zero wallet was never re-read after a day"
 
 

@@ -38,6 +38,11 @@ class TickResult:
     detail: str = ""
     # When a step was held back for budget: the time its calls will be affordable again.
     resume_at: float | None = None
+    # What actually happened, for the page. `ok` alone showed a budget DEFERRAL as "FAILED":
+    # ok | partial (some read, rest queued) | deferred (none yet, all queued) | skipped | failed
+    status: str | None = None
+    done: int | None = None
+    of: int | None = None
 
 
 def _ctx(token_id: int) -> tuple[str, str, str]:
@@ -153,8 +158,8 @@ def track_tape(token_id: int) -> TickResult:
                      (f["to_amount"] if f["side"] == "buy" else f["from_amount"]),
                      f["price_usd"], maker, int(is_ours), "geckoterminal", f.get("block")))
     new = db.record_trades(rows)
-    return TickResult("tape", True, 1, time.time() - t0,
-                      f"{len(rows)} fills seen, {new} new, {mine} ours"
+    return TickResult("tape", True, 1, time.time() - t0, done=new, of=len(rows),
+                      detail=f"{len(rows)} fills seen, {new} new, {mine} ours"
                       + (" · GAP: fills may have been missed, affected wallets will be re-read"
                          if gap else ""))
 
@@ -175,6 +180,17 @@ BALANCE_WORKERS = int(os.environ.get("PLUTUS_BALANCE_WORKERS") or 4)
 RECONCILE_S = int(os.environ.get("PLUTUS_RECONCILE_S") or 12 * 3600)
 # A wallet at zero with no fills since its last read has nothing to drift: at most daily.
 ZERO_RECHECK_S = 24 * 3600
+# Once a re-read PROVES one of our wallets moved outside the trade feed, every other wallet of ours
+# read before that proof is re-read within this long. Proof is rare and the error it implies is
+# real -- transfers between our own wallets double- or under-count the pair until both are read --
+# so it is corrected fast; the background ceiling already bounds how fast.
+URGENT_S = 3600
+# A staking/locking contract jumping is WEAKER evidence: outsiders stake too. Re-read within this.
+URGENT_WEAK_S = 3 * 3600
+# A re-read further than this from its rolled-forward estimate is drift, not rounding.
+DRIFT_TOLERANCE = 0.001
+# A staking/locking contract moving by more than this share of supply between two reads.
+LOCKED_JUMP = 0.0005
 
 # Calls held back from every sweep so a live campaign can still read prices and quotes when a
 # large inventory sweep would otherwise spend the hour's budget.
@@ -230,7 +246,10 @@ def track_inventory(token_id: int, full: bool = False, window_s: int = 3600,
     if holder is not None:
         return TickResult("inventory", False, 0, 0.0,
                           f"SKIPPED — a full read of this token is already running "
-                          f"({holder['owner']}, {db.now() - (holder['started'] or 0)}s ago)")
+                          f"({holder['owner']}, {db.now() - (holder['started'] or 0)}s ago)",
+                          status="skipped")
+    if not background:
+        db.record_full_request(token_id)
     beat = [time.time()]
 
     def heartbeat(done: int, of: int) -> None:
@@ -247,22 +266,47 @@ def track_inventory(token_id: int, full: bool = False, window_s: int = 3600,
 
 
 def _reconcile_pick(token_id: int, candidates: list[str], rows: dict, step_s: float) -> list[str]:
-    """The few stalest wallets due a re-read this step. Never-read ones are the delta's job."""
-    n = math.ceil(len(candidates) * step_s / RECONCILE_S) if step_s else 0
-    if not n:
+    """The wallets to re-read this step: the smallest steady rate that meets every deadline.
+
+    Each wallet's deadline is its last read plus its limit -- RECONCILE_S normally, ZERO_RECHECK_S
+    for an idle zero wallet, URGENT_S if it was read before tokens were caught moving outside the
+    feed. Sorted by deadline, the rate that meets them all is the maximum over k of k divided by
+    the time left until the k-th deadline. Reading that many each step, earliest deadline first,
+    keeps every wallet inside its limit while spreading the reads out.
+
+    WHY NOT "THE N STALEST, ONCE THEY ARE HALF A LIMIT OLD". A buy wave has every wallet re-read in
+    the same hour; they then all come due together and a fixed N could not clear them in time --
+    a simulated week had wallets 15 hours old against a 12-hour limit. Deadline order reads a few
+    of that cohort early, which spreads it out for good, at the same average cost.
+    """
+    if not step_s:
         return []
     now = db.now()
     fills = db.fills_after(token_id, {a: (rows[a][1], rows[a][2]) for a in candidates if a in rows})
-    due = []
+    drifted = db.drift_since(token_id, now - RECONCILE_S)
+    classes = db.class_map(token_id)
+    strong = max((r["ts"] for r in drifted if classes.get(r["address"]) == "ours"), default=None)
+    weak = max((r["ts"] for r in drifted if classes.get(r["address"]) != "ours"), default=None)
+    deadlines = []
     for a in candidates:
         if a not in rows:
-            continue
+            continue                               # never-read wallets are the delta's job
         tok, _h, obs = rows[a]
-        idle_zero = (not tok) and a not in fills
-        if now - obs >= (ZERO_RECHECK_S if idle_zero else RECONCILE_S / 2):
-            due.append((obs, a))
-    due.sort()
-    return [a for _o, a in due[:n]]
+        limit = ZERO_RECHECK_S if ((not tok) and a not in fills) else RECONCILE_S
+        deadline = obs + limit
+        # Measured from when the drift was CAUGHT, not from the wallet's own last read -- an
+        # old read would otherwise be overdue already and every such wallet read in one burst.
+        if strong and obs < strong:
+            deadline = min(deadline, strong + URGENT_S)
+        elif weak and obs < weak:
+            deadline = min(deadline, weak + URGENT_WEAK_S)
+        deadlines.append((deadline, a))
+    if not deadlines:
+        return []
+    deadlines.sort()
+    rate = max(k / max(d - now, step_s) for k, (d, _a) in enumerate(deadlines, 1))
+    n = math.ceil(rate * step_s - 1e-9)
+    return [a for _d, a in deadlines[:n]]
 
 
 def _inventory(token_id: int, full: bool, window_s: int, progress, fresh: bool,
@@ -292,9 +336,15 @@ def _inventory(token_id: int, full: bool, window_s: int, progress, fresh: bool,
         # missing fills.
         gap_ts = db.latest_tape_gap_ts(token_id)
         behind_gap = {a for a in ours if gap_ts and a in rows and rows[a][2] < gap_ts}
-        # the pool moves on every fill, so it is always re-read
-        targets = sorted((set(ours) - known) | behind_gap
-                         | {a for a in others if cmap[a] == "pool"}
+        # Wallets a full pull could not reach are QUEUED: read before the operator's request,
+        # they are picked up here as the background budget allows.
+        req_ts = db.full_request_ts(token_id)
+        requested = {a for a in ours + others if req_ts and a in rows and rows[a][2] < req_ts}
+        # The pool moves on every fill, and a staking / locking contract moves whenever anyone
+        # stakes: both are re-read every step -- a handful of addresses, and the ledger is wrong
+        # about everyone's float while either is stale.
+        targets = sorted((set(ours) - known) | behind_gap | requested
+                         | {a for a in others if cmap[a] in ("pool", "locked")}
                          | (set(others) - known)
                          | set(_reconcile_pick(token_id, ours + others, rows, reconcile)))
 
@@ -321,6 +371,7 @@ def _inventory(token_id: int, full: bool, window_s: int, progress, fresh: bool,
         return (4, latest[w][2])               # then stalest first
 
     targets.sort(key=priority)
+    n_total = len(targets)
     deferred: list[str] = []
     # `left` is the tighter of the hour and the day FOR THIS TIER: background work stops at its
     # own share and never eats into what is kept for the operator.
@@ -394,14 +445,56 @@ def _inventory(token_id: int, full: bool, window_s: int, progress, fresh: bool,
         return TickResult("inventory", False, calls, time.time() - t0,
                           f"ABORTED after {calls} of {len(targets)} wallets — {skipped} calls "
                           f"not made because the token was deleted")
+    # DRIFT: a re-read that does not match the last read rolled forward by our fills means
+    # tokens moved outside the trade feed -- a transfer, staking, another venue. Other wallets may
+    # have moved in the same way, so it is recorded and their re-reads are brought forward. A
+    # simulated week showed why it matters: transfers between our own wallets double-counted
+    # 2.2% of the position while half the pair had been re-read and half had not.
+    # A wallet last read before a gap in the trade feed is ALREADY scheduled for re-read, and
+    # its difference is the fills the feed dropped, not a transfer. Counted as drift, one gap
+    # in a buy wave set off a second full pass on top of the first.
+    gap_before = db.latest_tape_gap_ts(token_id)
+    prior = {w: (latest[w][1], latest[w][2]) for w, _t, _h in rows
+             if w in latest and cmap.get(w) == "ours"
+             and not (gap_before and latest[w][2] < gap_before)}
+    rolled = db.fills_after(token_id, prior) if prior else {}
+    token = db.token_row(token_id)
+    supply = float(token["supply_nominal"] or 0) if token is not None else 0.0
+    moved = []
+    for w, tok, _h in rows:
+        if w in prior:
+            expected = latest[w][0] + rolled.get(w, (0.0, 0))[0]
+            if abs(tok - expected) > max(1.0, DRIFT_TOLERANCE * max(abs(tok), abs(expected))):
+                moved.append((w, tok - expected))
+        # A STAKING OR LOCKING CONTRACT THAT JUMPS is evidence that wallets moved tokens into or
+        # out of it, and ours may be among them. It is re-read every step, so this fires within
+        # minutes -- whereas waiting for one of our staking wallets to come up for its own
+        # re-read left a 3.4% position error standing for six hours in a simulated week.
+        elif cmap.get(w) == "locked" and w in latest:
+            if supply and abs(tok - latest[w][0]) > LOCKED_JUMP * supply:
+                moved.append((w, tok - latest[w][0]))
     db.record_balances(token_id, rows)
+    if moved:
+        db.record_drift(token_id, moved)
+        # %-formatting has no thousands separator: "%+,.0f" raised inside logging itself.
+        net = f"{sum(d for _w, d in moved):+,.0f}"
+        log.info("token %s: %d address(es) changed outside the trade feed (net %s tokens) — "
+                 "re-reading our other wallets within %dh", token_id, len(moved), net,
+                 URGENT_S // 3600)
     ok = not failed and not deferred
     if failed:
-        log.warning("inventory for token %s: %d balance read(s) failed, e.g. %s",
-                    token_id, len(failed), first_error[0] if first_error else "?")
-    resume_at = (gmgn.budget(background=background, need=len(deferred)).get("resumes_at")
+        # A few failures are routine and the wallets are simply read next time; many at once is
+        # a pattern worth a warning.
+        level = log.warning if len(failed) > max(2, len(rows) // 20) else log.info
+        level("inventory for token %s: %d balance read(s) failed, e.g. %s",
+              token_id, len(failed), first_error[0] if first_error else "?")
+    # Deferred wallets are read by the BACKGROUND sweep, so that tier says when they will be.
+    resume_at = (gmgn.budget(background=True, need=len(deferred)).get("resumes_at")
                  if deferred else None)
-    return TickResult("inventory", ok, calls, time.time() - t0, resume_at=resume_at, detail=
+    status = ("ok" if ok else "partial" if deferred and rows else "deferred" if deferred
+              else "failed")
+    return TickResult("inventory", ok, calls, time.time() - t0, resume_at=resume_at,
+                      status=status, done=len(rows), of=n_total, detail=
                       (f"{len(deferred)} of {len(targets) + len(deferred)} wallets DEFERRED — "
                        f"the hour's API budget is committed; they are read next as it frees · "
                        if deferred else "") +
@@ -435,7 +528,7 @@ def track_census(token_id: int, background: bool = False) -> TickResult:
     if left is not None and need > left - (0 if background else BUDGET_RESERVE):
         return TickResult("census", False, 0, time.time() - t0,
                           f"DEFERRED — a census needs {need} calls and {left} are available",
-                          resume_at=b.get("resumes_at"))
+                          resume_at=b.get("resumes_at"), status="deferred")
 
     def interrupted(exc: Exception) -> TickResult:
         # A census the budget cuts short is DISCARDED, not recorded. Recorded, it became the
@@ -446,7 +539,8 @@ def track_census(token_id: int, background: bool = False) -> TickResult:
         return TickResult("census", False, calls, time.time() - t0,
                           f"INCOMPLETE after {slices} slices — budget; kept the previous census",
                           resume_at=gmgn.budget(background=background,
-                                                need=CENSUS_SLICES).get("resumes_at"))
+                                                need=CENSUS_SLICES).get("resumes_at"),
+                          status="deferred")
     rows: dict[str, dict] = {}
     tagged: dict[str, set[str]] = {}
     calls = slices = 0

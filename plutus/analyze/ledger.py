@@ -183,6 +183,23 @@ def build(token_id: int) -> Ledger:
         notes.append(f"{len(negative)} of our wallets sold more than their last read held — "
                      f"tokens moved in from outside the tracked pool; shown as 0 until re-read")
     notes.extend(census_notes(token_id))
+    from plutus.track.trackers import RECONCILE_S               # never imports this module
+    overdue = [a for a in ours_addrs if a in rows and db.now() - rows[a][2] > RECONCILE_S + 600]
+    if overdue:
+        notes.append(f"{len(overdue)} of our wallets are past their {RECONCILE_S // 3600}h "
+                     f"re-check — the API budget has been in use elsewhere. Their positions "
+                     f"include every trade since, but not transfers or staking; a full pull "
+                     f"re-reads them now.")
+    moved = db.drift_since(token_id, db.now() - 86400)
+    if moved:
+        caught = max(r["ts"] for r in moved)
+        behind = [a for a in ours_addrs if a in rows and rows[a][2] < caught]
+        if behind:
+            notes.append(f"tokens moved outside the trade feed (transfers, staking or another "
+                         f"venue): {len(moved)} wallet(s) caught so far, net "
+                         f"{sum(r['delta'] or 0 for r in moved):+,.0f}. {len(behind)} of our "
+                         f"wallets were read before that and are being re-checked within "
+                         f"~2h — until then our position may be off. A full pull corrects it now.")
     gap_ts = db.latest_tape_gap_ts(token_id)
     if gap_ts:
         behind = [a for a in ours_addrs if a in rows and rows[a][2] < gap_ts]

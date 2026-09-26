@@ -491,16 +491,36 @@ async function pull(full){
   try{
     const r=await (await fetch(`/api/refresh?token_id={{ token_id }}&full=${full?1:0}`,{method:'POST'})).json();
     if(r.error){ st.innerHTML='<span class="bad">'+r.error+'</span>'; }
-    else if(r.running){ return poll(); }
+    else if(r.running){
+      const e=r.estimate;
+      if(e){ st.innerHTML='<span class="spin"></span> full pull — needs ~'+e.calls+' calls, '
+        + e.available+' available now' + (e.queued? ` · ${e.now} now, ${e.queued} queued, `
+        + `complete by ~${hhmm(e.completes_at)}` : ' · all of it now'); }
+      return poll();
+    }
     else { st.innerHTML=summarise(r.results); await reload(); }
   }catch(e){ st.innerHTML='<span class="bad">pull failed: '+e+'</span>'; }
   q.disabled=f.disabled=false;
 }
+// A budget DEFERRAL is not a failure. Shown as "FAILED" it read as if the pull had broken,
+// when it had read 257 of 438 wallets and queued the rest.
+function hhmm(ts){ return ts? new Date(ts*1000).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}) : ''; }
+function outcome(r){
+  const when = r.resume_at? ` — rest by ~${hhmm(r.resume_at)}` : '';
+  switch(r.status || (r.ok? 'ok' : 'failed')){
+    case 'ok':       return `${r.name} ok`;
+    case 'partial':  return `${r.name} PARTIAL ${r.done}/${r.of} (rest queued${when})`;
+    case 'deferred': return `${r.name} DEFERRED (queued${when})`;
+    case 'skipped':  return `${r.name} SKIPPED (already running)`;
+    default:         return `${r.name} FAILED`;
+  }
+}
 function summarise(rs){
   if(!rs||!rs.length) return 'nothing returned';
-  const bad=rs.filter(r=>!r.ok);
-  return (bad.length?'<span class="warn">':'<span class="good">')
-    + rs.map(r=>`${r.name} ${r.ok?'ok':'FAILED'}`).join(' · ')
+  const failed=rs.filter(r=>(r.status||(r.ok?'ok':'failed'))==='failed');
+  const held=rs.filter(r=>['partial','deferred','skipped'].includes(r.status));
+  return (failed.length?'<span class="bad">':held.length?'<span class="warn">':'<span class="good">')
+    + rs.map(outcome).join(' · ')
     + `</span> <span class="dim">· ${rs.reduce((a,r)=>a+(r.calls||0),0)} calls, `
     + `${rs.reduce((a,r)=>a+(r.seconds||0),0).toFixed(1)}s</span>`;
 }

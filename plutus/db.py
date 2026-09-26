@@ -141,6 +141,21 @@ CREATE TABLE IF NOT EXISTS scan_lock (
   token_id INTEGER PRIMARY KEY, owner TEXT NOT NULL, started INTEGER, expires INTEGER NOT NULL
 );
 
+-- When the operator last asked for a full read. A pull the budget cannot finish in one go reads
+-- what it can; every wallet read before this moment is then queued for the background sweep, so
+-- "the rest is queued" is a fact, not a hope.
+CREATE TABLE IF NOT EXISTS full_requests (
+  token_id INTEGER PRIMARY KEY, ts INTEGER NOT NULL
+);
+
+-- A wallet whose re-read did not match its rolled-forward estimate: tokens moved OUTSIDE the
+-- trade feed (a transfer, staking, another venue). Evidence that other wallets may have moved
+-- too, so their re-reads are brought forward.
+CREATE TABLE IF NOT EXISTS drift (
+  token_id INTEGER NOT NULL, ts INTEGER NOT NULL, address TEXT NOT NULL, delta REAL,
+  PRIMARY KEY (token_id, ts, address)
+);
+
 CREATE TABLE IF NOT EXISTS tape_gaps (
   token_id INTEGER NOT NULL, ts INTEGER NOT NULL,
   after_block INTEGER, before_block INTEGER,
@@ -283,7 +298,7 @@ def record_trades(rows: list[tuple]) -> int:
 # operator believes finished, which is the worst possible outcome for a delete button.
 TOKEN_KEYED = ("venues", "addresses", "calibration", "pool_obs", "trades", "balances",
                "census", "census_meta", "ticks", "campaigns", "pool_parity", "tape_gaps",
-               "scan_lock")
+               "scan_lock", "full_requests", "drift")
 
 
 def delete_token(token_id: int) -> dict:
@@ -497,6 +512,79 @@ def scan_lock_holder(token_id: int) -> dict | None:
         return dict(row) if row else None
     finally:
         c.close()
+
+
+def record_drift(token_id: int, moved: list[tuple[str, float]]) -> None:
+    t = now()
+    connect().executemany("INSERT OR REPLACE INTO drift VALUES (?,?,?,?)",
+                          [(token_id, t, a, d) for a, d in moved])
+    connect().commit()
+
+
+def drift_since(token_id: int, since: int) -> list[sqlite3.Row]:
+    return connect().execute("SELECT * FROM drift WHERE token_id=? AND ts>=? ORDER BY ts",
+                             (token_id, since)).fetchall()
+
+
+# ── retention ────────────────────────────────────────────────────────────────
+# NOTHING WAS EVER DELETED. A simulated week wrote 121,000 census rows (one snapshot of every holder
+# each hour, forever) and ~10,000 pool observations. Left running for weeks, the database grows
+# without bound and every query over it slows. Only the latest census is ever read; history
+# beyond these windows is not used by anything.
+RETAIN_S = {"pool_obs": 7 * 86400, "tape_gaps": 7 * 86400, "pool_parity": 7 * 86400,
+            "drift": 7 * 86400, "census_meta": 30 * 86400, "trades": 30 * 86400,
+            "balances": 14 * 86400}
+KEEP_CENSUS_SWEEPS = 2
+
+
+def prune(token_id: int) -> dict[str, int]:
+    """Delete history nothing reads. Safe to run often; returns rows removed per table."""
+    c = connect()
+    t = now()
+    out: dict[str, int] = {}
+    for table, col in (("pool_obs", "ts"), ("tape_gaps", "ts"), ("pool_parity", "ts"),
+                       ("drift", "ts"), ("census_meta", "sweep_ts")):
+        out[table] = c.execute(f"DELETE FROM {table} WHERE token_id=? AND {col}<?",
+                               (token_id, t - RETAIN_S[table])).rowcount
+    # Trades feed the flow windows and every running campaign's own history, so never drop a
+    # trade a running campaign can still see.
+    cutoff = t - RETAIN_S["trades"]
+    row = c.execute("SELECT MIN(started_ts) s FROM campaigns WHERE token_id=? AND "
+                    "state='running'", (token_id,)).fetchone() if _has_table(c, "campaigns") else None
+    if row and row["s"]:
+        cutoff = min(cutoff, row["s"])
+    out["trades"] = c.execute("DELETE FROM trades WHERE token_id=? AND ts<?",
+                              (token_id, cutoff)).rowcount
+    # Balances: history older than the window, but NEVER an address's latest read.
+    out["balances"] = c.execute(
+        "DELETE FROM balances WHERE token_id=? AND observed_ts<? AND observed_ts<"
+        "(SELECT MAX(b2.observed_ts) FROM balances b2 WHERE b2.token_id=balances.token_id "
+        "AND b2.address=balances.address)", (token_id, t - RETAIN_S["balances"])).rowcount
+    sweeps = [r["sweep_ts"] for r in c.execute(
+        "SELECT DISTINCT sweep_ts FROM census WHERE token_id=? ORDER BY sweep_ts DESC",
+        (token_id,)).fetchall()]
+    out["census"] = 0
+    for s in sweeps[KEEP_CENSUS_SWEEPS:]:
+        out["census"] += c.execute("DELETE FROM census WHERE token_id=? AND sweep_ts=?",
+                                   (token_id, s)).rowcount
+    c.commit()
+    return out
+
+
+def _has_table(c: sqlite3.Connection, name: str) -> bool:
+    return c.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                     (name,)).fetchone() is not None
+
+
+def record_full_request(token_id: int) -> None:
+    connect().execute("INSERT OR REPLACE INTO full_requests VALUES (?,?)", (token_id, now()))
+    connect().commit()
+
+
+def full_request_ts(token_id: int) -> int | None:
+    row = connect().execute("SELECT ts FROM full_requests WHERE token_id=?",
+                            (token_id,)).fetchone()
+    return row["ts"] if row else None
 
 
 def latest_census_meta(token_id: int) -> sqlite3.Row | None:

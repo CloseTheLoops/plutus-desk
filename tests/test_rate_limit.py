@@ -24,6 +24,15 @@ import time
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
+# NEVER THE PRODUCTION DATABASE -- including in the worker processes, which inherit this
+# environment. They used to open the server's own database and spend its real budget.
+import os as _os  # noqa: E402
+_os.environ["PLUTUS_DB"] = str(pathlib.Path(tempfile.gettempdir())
+                               / f"plutus_ratelimit_{_os.getpid()}.db")
+_os.environ.setdefault("PLUTUS_MAX_CALLS_HOUR", "1000000")
+_os.environ.setdefault("PLUTUS_MAX_CALLS_DAY", "10000000")
+from plutus import config  # noqa: E402
+config.DB_PATH = pathlib.Path(_os.environ["PLUTUS_DB"])
 from plutus.sources import gmgn  # noqa: E402
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent

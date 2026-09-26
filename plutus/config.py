@@ -18,7 +18,9 @@ from pathlib import Path
 BASE_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = BASE_DIR / "data"
 TOKENS_DIR = BASE_DIR / "tokens"
-DB_PATH = DATA_DIR / "plutus.db"
+# PLUTUS_DB redirects the database: tests use it so they never read or spend the production
+# budget, and it lets a second instance run beside the first without sharing state.
+DB_PATH = Path(os.environ["PLUTUS_DB"]) if os.environ.get("PLUTUS_DB") else DATA_DIR / "plutus.db"
 CACHE_DIR = DATA_DIR / "cache"
 
 DATA_DIR.mkdir(exist_ok=True)

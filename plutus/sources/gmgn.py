@@ -152,6 +152,14 @@ class RateLimited(GmgnError):
     """GMGN answered 429. Every caller has already been paused; never retried on another path."""
 
 
+class Transient(GmgnError):
+    """A 5xx or a network failure: retry the same path, never re-send it through the CLI.
+
+    The CLI calls the same API. A 500 there is a 500 here, so falling back to it spent a second
+    call on the same failure and logged two warnings for it.
+    """
+
+
 def _env() -> dict[str, str] | None:
     """Point gmgn-cli at the analytics profile, or inherit if there isn't one.
 
@@ -279,13 +287,20 @@ def _http_call(args: tuple[str, ...], background: bool = False) -> Any:
     params["client_id"] = str(uuid.uuid4())
 
     _pace(background)
-    r = _get_session().request(
-        method, HOST + path, params=params, timeout=TIMEOUT,
-        headers={"X-APIKEY": key, "Content-Type": "application/json",
-                 "User-Agent": "gmgn-cli/1.5.6"})
+    try:
+        r = _get_session().request(
+            method, HOST + path, params=params, timeout=TIMEOUT,
+            headers={"X-APIKEY": key, "Content-Type": "application/json",
+                     "User-Agent": "gmgn-cli/1.5.6"})
+    except requests.RequestException as exc:
+        # A dropped connection or a timeout used to escape as a non-GMGN exception, which no
+        # caller catches -- one timeout aborted an entire wallet sweep.
+        raise Transient(f"network {path}: {str(exc)[:120]}") from None
     if r.status_code == 429:
         pause_all(min((_cooldown("RATE_LIMIT " + r.text) or 35) + 3, MAX_WAIT_S), path)
         raise RateLimited(f"RATE_LIMIT {path}: {r.text[:160]}")
+    if r.status_code >= 500:
+        raise Transient(f"http {r.status_code} {path}")
     if r.status_code != 200:
         raise GmgnError(f"http {r.status_code} {path}: {r.text[:160]}")
     body = r.json()
@@ -449,6 +464,9 @@ def budget(background: bool = False, need: int = 1) -> dict:
             "background": background, "ok": hour < hcap and day < dcap}
 
 
+_PAUSES: list[float] = []
+
+
 def pause_all(seconds: float, why: str = "") -> None:
     """Hold EVERY caller -- every thread, every process on this key -- for `seconds`.
 
@@ -472,8 +490,17 @@ def pause_all(seconds: float, why: str = "") -> None:
     except sqlite3.Error:
         _last_call, extended = max(_last_call, until), True
     if extended:
-        log.warning("GMGN rate limit%s — every worker paused for %ds",
-                    f" on {why}" if why else "", int(seconds))
+        _PAUSES.append(time.time())
+        recent = [p for p in _PAUSES if time.time() - p < 600]
+        _PAUSES[:] = recent
+        # One line when a burst of 429s starts, then silence for ten minutes: during a storm the
+        # old code logged every pause.
+        if len(recent) == 1:
+            log.warning("GMGN rate limit%s — every worker paused for %ds",
+                        f" on {why}" if why else "", int(seconds))
+        elif len(recent) in (10, 50):
+            log.warning("GMGN rate limits continuing: %d pauses in the last 10 minutes",
+                        len(recent))
 
 
 def _cooldown(err: str) -> int | None:
@@ -518,6 +545,12 @@ def call(*args: str, attempts: int = 3, fresh: bool = False, background: bool = 
                 # mid-limit: that was a second call into an active 429.
                 if attempt == attempts:
                     raise
+            except Transient as exc:
+                if attempt == attempts:
+                    raise
+                log.debug("transient failure on %s (attempt %d): %s", " ".join(args[:2]),
+                          attempt, exc)
+                time.sleep(0.5 * attempt)
             except GmgnError:
                 log.warning("http path failed for %s, falling back to the CLI",
                             " ".join(args[:3]))
